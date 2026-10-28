@@ -2220,7 +2220,7 @@ export interface TaskItem {
 	agent?: string;
 	/** Historical source session selected by the bundled consult agent. */
 	sourceSession?: string;
-	/** Optional model selector override for the historical source session. */
+	/** Per-spawn model selector or @role; seance also accepts a selector array. */
 	model?: string | string[];
 	/** The work; required by the schema. */
 	task?: string;
@@ -2251,7 +2251,7 @@ export interface TaskParams {
 	agent?: string;
 	/** Historical source session selected by the bundled consult agent. */
 	sourceSession?: string;
-	/** Optional model selector override for the historical source session. */
+	/** Per-spawn model selector or @role; seance also accepts a selector array. */
 	model?: string | string[];
 	/** The work (flat form). */
 	task?: string;

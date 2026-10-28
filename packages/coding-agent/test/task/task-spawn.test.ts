@@ -277,7 +277,7 @@ describe("task spawn routing", () => {
 		expect(signals).toHaveLength(1);
 		expect(signals[0]).toBeInstanceOf(AbortSignal);
 		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini-1"]);
-		expect(runSpy.mock.calls[0]?.[0].modelRoute).toBe("pool 1");
+		expect(runSpy.mock.calls[0]?.[0].modelRoute).toBe("Automatic model selection unavailable; using existing model resolution. Extension replaced the model: pool 1");
 	});
 
 	for (const { label, runnerOverrides, expectRetained } of [

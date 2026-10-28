@@ -26,6 +26,13 @@ function settledResult(output: string): SingleResult {
 }
 
 describe("formatTaskResultSummary", () => {
+	it("reports requested and actual models when a fallback serves the task", () => {
+		const summary = formatTaskResultSummary({ ...settledResult("done"), resolvedModel: "provider/fallback", resolvedModelIsFallback: true, resolvedModelRoute: "extension route" }, { totalDurationMs: 5, requestedModel: "@worker" });
+		expect(summary).toContain("<requested-model>@worker</requested-model>");
+		expect(summary).toContain('<model fallback="true">provider/fallback</model>');
+		expect(summary).toContain("<model-route>extension route</model-route>");
+	});
+
 	it("previews a pretty-printed structured yield past its opening brace", () => {
 		// A schema-bearing subagent's artifact is `JSON.stringify(data, null, 2)`:
 		// the first line is `{` and the second is one multi-KB string. Cutting the

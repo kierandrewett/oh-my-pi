@@ -432,6 +432,8 @@ export interface ExecutorOptions {
 	 */
 	detached?: boolean;
 	modelOverride?: string | string[];
+	/** Caller selector that must resolve before routing or fallback. */
+	explicitModel?: string;
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
 	/** Extension routing note for the chosen model; surfaced as `resolvedModelRoute`. */
@@ -2191,6 +2193,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	};
 
 	const attach = (session: AgentSession): (() => void) => {
+		const initialAuthFallback = progress.resolvedModelIsFallback === true;
+		const initialModelIdentity = progress.resolvedModelIdentity;
 		// The session owns attribution: it knows which model produced its output
 		// and withholds an armed-but-unproven fallback. Re-deriving that here from
 		// the event stream got it wrong twice over — the stream also carries
@@ -2199,7 +2203,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		const publishServingModel = (): void => {
 			const serving = session.servingModel;
 			if (!serving) return;
-			const isFallback = serving.isFallback;
+			const isFallback = serving.isFallback || (initialAuthFallback && (!serving.modelIdentity || serving.modelIdentity === initialModelIdentity));
 			// A model swap moves the window the usage gauge divides by. Without
 			// this the Agent Hub kept the startup model's window while labelling
 			// the row with the fallback that replaced it. Models with no declared
@@ -4486,6 +4490,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			checkAbort();
 
+			if (options.explicitModel !== undefined) {
+				const explicitModel = options.explicitModel;
+				const disabledProviders = new Set(cfgDisabledProviders.get(settings));
+				const enabledModels = () => modelRegistry.getAvailable().filter(model => !disabledProviders.has(model.provider));
+				const resolveExplicit = () => resolveModelOverride([explicitModel], { getAvailable: enabledModels }, settings);
+				let explicit = resolveExplicit();
+				if (!explicit.model && typeof modelRegistry.awaitBackgroundRefresh === "function") {
+					await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
+					explicit = resolveExplicit();
+				}
+				if (!explicit.model) throw new Error(`Cannot resolve explicit subagent model ${JSON.stringify(explicitModel)}.`);
+			}
 			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
 			const inheritedRetryFallbackChain =
 				configuredModelPatterns.length === 1
@@ -4510,6 +4526,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					id,
 				),
 			);
+			if (options.explicitModel !== undefined && !model) {
+				throw new Error(`Cannot resolve routed subagent model for ${JSON.stringify(options.explicitModel)}.`);
+			}
+			if (authFallbackUsed) progress.resolvedModelIsFallback = true;
 			if (modelResolutionWarning) {
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,

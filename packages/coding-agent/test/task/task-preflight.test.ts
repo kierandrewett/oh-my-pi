@@ -91,6 +91,16 @@ describe("task async preflight", () => {
 			expectation: 'Unknown agent "missing"',
 		},
 		{
+			name: "UnknownRole",
+			params: { agent: "task", name: "UnknownRole", task: "Work.", model: "@not-configured" },
+			expectation: "Unknown model role",
+		},
+		{
+			name: "EmptyModel",
+			params: { agent: "task", name: "EmptyModel", task: "Work.", model: " " },
+			expectation: "non-empty string",
+		},
+		{
 			name: "Disabled",
 			params: { agent: "task", name: "Disabled", task: "Work." },
 			settings: { "task.disabledAgents": ["task"] },

@@ -115,6 +115,7 @@ describe("task.batch schema gating", () => {
 		expect(offProperties.context).toBeUndefined();
 		expect(offProperties.task).toBeDefined();
 		expect(offProperties.name).toBeDefined();
+		expect(offProperties.model).toBeDefined();
 		expect(offProperties.outputSchema).toBeDefined();
 		expect(typeof offProperties.outputSchema).toBe("object");
 		expect(offProperties.schemaMode).toBeDefined();
@@ -134,6 +135,7 @@ describe("task.batch schema gating", () => {
 		expect(itemProperties.task).toBeDefined();
 		expect(itemProperties.name).toBeDefined();
 		expect(itemProperties.agent).toBeDefined();
+		expect(itemProperties.model).toBeDefined();
 		expect(itemProperties.outputSchema).toBeDefined();
 		expect(typeof itemProperties.outputSchema).toBe("object");
 		expect(itemProperties.schemaMode).toBeDefined();
@@ -390,20 +392,44 @@ describe("task.batch validation", () => {
 		expect(toolResult?.role === "toolResult" && toolResult.isError).toBe(false);
 	});
 
+	it.each([
+		{ batch: true, structured: false, isolation: false, seance: false },
+		{ batch: true, structured: true, isolation: false, seance: false },
+		{ batch: true, structured: false, isolation: true, seance: false },
+		{ batch: true, structured: true, isolation: true, seance: false },
+		{ batch: true, structured: false, isolation: false, seance: true },
+		{ batch: false, structured: false, isolation: false, seance: false },
+	])("forwards a normal model through wire validation: $batch $structured $isolation $seance", async ({ batch, structured, isolation, seance }) => {
+		const bundledSeance = loadBundledAgents().find(agent => agent.name === "seance")!;
+		mockDiscovery(seance ? [taskAgent, bundledSeance] : taskAgent);
+		const run = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(createSession({ settings: {
+			"async.enabled": false, "task.batch": batch, "task.structured": structured, "task.isolation.enabled": isolation,
+		} }));
+		const item = { name: "Alpha", agent: "task", task: "Do A.", solutionSpace: "c", model: "stub/model-b" };
+		const mock = createMockModel({ responses: [
+			{ content: [{ type: "toolCall", id: "tc-model-pin", name: "task", arguments: batch ? { context: "shared", tasks: [item] } : item }] },
+			{ content: ["done"] },
+		] });
+		const agent = new Agent({ initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool as unknown as AgentTool], messages: [] }, streamFn: mock.stream });
+		await agent.prompt("go");
+		const result = agent.state.messages.find(message => message.role === "toolResult");
+		expect(result?.role === "toolResult" && result.isError).toBe(false);
+		expect(run.mock.calls[0]?.[0].modelOverride).toEqual(["stub/model-b"]);
+	});
+
 	// The agent loop validates arguments against the wire schema before execute(),
-	// and that schema deletes undeclared keys. A seance-only field on an ordinary
-	// agent must still be refused by every call form instead of being dropped,
-	// leaving the child on its own model while the caller believes it pinned another.
+	// and that schema deletes undeclared keys. A seance-only sourceSession on an
+	// ordinary agent must still be refused instead of being dropped.
 	// `task.structured` and `task.isolation.enabled` choose between the prebuilt and
 	// generated batch schemas, each with and without `isolated`.
 	it.each([
-		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: false, field: "model" },
-		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: false, field: "model" },
-		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: true, field: "model" },
-		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: true, field: "model" },
 		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: false, field: "sourceSession" },
-		{ form: "batch", seance: "advertised", batch: true, structured: false, isolation: false, field: "model" },
-		{ form: "flat", seance: "hidden", batch: false, structured: false, isolation: false, field: "model" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: false, field: "sourceSession" },
+		{ form: "batch", seance: "hidden", batch: true, structured: false, isolation: true, field: "sourceSession" },
+		{ form: "batch", seance: "hidden", batch: true, structured: true, isolation: true, field: "sourceSession" },
+		{ form: "batch", seance: "advertised", batch: true, structured: false, isolation: false, field: "sourceSession" },
+		{ form: "flat", seance: "hidden", batch: false, structured: false, isolation: false, field: "sourceSession" },
 	])(
 		"refuses $field on an ordinary agent in the $form form with seance $seance (structured: $structured, isolation: $isolation)",
 		async ({ seance, batch, structured, isolation, field }) => {
@@ -479,6 +505,28 @@ describe("task.batch spawning", () => {
 		}
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("routes each batch item's model ahead of its agent override", async () => {
+		mockDiscovery({ ...taskAgent, model: ["provider/default"] });
+		const seen = new Map<string, string | string[] | undefined>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			seen.set(options.id ?? "?", options.modelOverride);
+			return makeResult(options.id ?? "?");
+		});
+		const tool = await TaskTool.create(createSession({ settings: {
+			"async.enabled": false, "task.batch": true,
+			"task.agentModelOverrides": { task: "provider/override" },
+			modelRoles: { worker: "provider/role-model" },
+		} }));
+		await tool.execute("mixed-models", { context: "Shared", tasks: [
+			{ name: "Role", task: "A", model: "@worker" },
+			{ name: "Concrete", task: "B", model: "provider/other" },
+			{ name: "Default", task: "C" },
+		] });
+		expect(seen.get("Role")).toEqual(["provider/role-model"]);
+		expect(seen.get("Concrete")).toEqual(["provider/other"]);
+		expect(seen.get("Default")).toEqual(["provider/override"]);
 	});
 
 	it("spawns one background job per task item and forwards independent models and schemas with shared context", async () => {

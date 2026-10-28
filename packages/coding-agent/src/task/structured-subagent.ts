@@ -9,7 +9,7 @@ import * as os from "node:os";
 import path from "node:path";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
-import { resolveAgentModelSelection, resolveConfiguredModelPatterns } from "../config/model-resolver";
+import { resolveAgentModelSelection, resolveConfiguredModelPatterns, resolveExplicitModelRole } from "../config/model-resolver";
 import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
 import {
 	type CompactionThresholdPair,
@@ -21,6 +21,7 @@ import type { EffectiveExtensionRoots } from "../capability/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
+import { journalJudgmentUsage } from "../judgment";
 import { MCPManager } from "../mcp/manager";
 import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -33,6 +34,7 @@ import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
+import { classifyAutoTaskModel } from "./auto-model";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "./executor";
 import {
@@ -176,7 +178,7 @@ export interface EffectiveSubagentPolicy {
 	preparedSession?: PreparedSeanceSession;
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
-	/** Extension routing note explaining a `before_subagent_spawn` model replacement. */
+	/** Automatic selection and extension routing notes surfaced with the result. */
 	modelRoute?: string;
 	/** Exact-name `task.agentServiceTierOverrides` entry for this agent, applied after model resolution. */
 	serviceTierOverride?: ServiceTierInheritSettingValue;
@@ -428,6 +430,17 @@ export async function resolveEffectiveSubagentPolicy(
 		: undefined;
 	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(request.session.settings));
 	const oauthAccountPools = Object.hasOwn(agentAccountPools, agentName) ? agentAccountPools[agentName] : undefined;
+	if (request.invocationKind === "task" && !isBundledSeance(agent) && request.model !== undefined) {
+		if (typeof request.model !== "string" || !request.model.trim()) {
+			throw new StructuredSubagentError("preflight", "The explicit model selector must be a non-empty string.");
+		}
+		if (request.model.trim().startsWith("@") && !resolveExplicitModelRole(request.model, request.session.settings)) {
+			throw new StructuredSubagentError("preflight", `Unknown model role ${JSON.stringify(request.model)}.`);
+		}
+		if (resolveConfiguredModelPatterns(request.model, request.session.settings).length === 0) {
+			throw new StructuredSubagentError("preflight", `Cannot resolve model selector ${JSON.stringify(request.model)}.`);
+		}
+	}
 	const hasPreparedSeance = preparedSeance !== undefined;
 	const parentActiveModelPattern = hasPreparedSeance ? undefined : request.session.getActiveModelString?.();
 	const modelResolution = {
@@ -483,6 +496,45 @@ export async function resolveEffectiveSubagentPolicy(
 	};
 }
 
+/** Classify only at dispatch, not during side-effect-free frontend preflight. */
+async function applyAutoTaskModel(
+	request: StructuredSubagentRequest,
+	policy: EffectiveSubagentPolicy,
+): Promise<EffectiveSubagentPolicy> {
+	if (request.invocationKind !== "task" || request.model !== undefined || policy.preparedSession !== undefined) {
+		return policy;
+	}
+	request.signal?.throwIfAborted();
+	const registry = request.session.modelRegistry;
+	const decision = registry
+		? await classifyAutoTaskModel({
+				settings: request.session.settings,
+				registry,
+				sessionModel: request.session.getActiveModel?.(),
+				task: request.assignment,
+				context: request.context,
+				agent: policy.agentName,
+				signal: request.signal,
+				sessionId: request.session.getSessionId?.() ?? undefined,
+				onUsage: journalJudgmentUsage(request.session.sessionManager),
+				telemetry: request.session.getTelemetry?.(),
+				costGate: request.session.costGate,
+			})
+		: undefined;
+	if (!decision) {
+		return { ...policy, modelRoute: "Automatic model selection unavailable; using existing model resolution." };
+	}
+	const selection = resolveAgentModelSelection({ requestModel: decision.role, settings: request.session.settings });
+	return {
+		...policy,
+		modelOverride: selection.patterns,
+		modelRole: selection.role,
+		modelRoute: decision.fallback
+			? `Automatic model selection: ${decision.role} (conservative fallback).`
+			: `Automatic model selection: ${decision.role}.`,
+	};
+}
+
 /**
  * Fire `before_subagent_spawn` for an actual child dispatch. Kept out of
  * {@link resolveEffectiveSubagentPolicy} because frontends run that as a
@@ -514,10 +566,13 @@ async function applySpawnHook(
 	if (spawnResult?.block) {
 		throw new StructuredSubagentError("preflight", spawnResult.reason ?? "Subagent spawn blocked by extension.");
 	}
-	if (spawnResult?.model === undefined) return policy;
+	if (spawnResult?.model === undefined || (request.invocationKind === "task" && request.model !== undefined)) return policy;
 	const replacement = resolveConfiguredModelPatterns(spawnResult.model, request.session.settings);
 	if (replacement.length === 0) return policy;
-	return { ...policy, modelOverride: replacement, modelRoute: spawnResult.note };
+	const route = policy.modelRoute
+		? `${policy.modelRoute} Extension replaced the model${spawnResult.note ? `: ${spawnResult.note}` : "."}`
+		: spawnResult.note;
+	return { ...policy, modelOverride: replacement, modelRoute: route };
 }
 
 /** Reserve a session-global agent id only after preflight has succeeded. */
@@ -612,6 +667,7 @@ function buildExecutorOptions(
 		invokedAt: request.invokedAt,
 		acquiredAt: request.acquiredAt,
 		modelOverride: policy.modelOverride,
+		explicitModel: request.invocationKind === "task" && preparedSession === undefined && typeof request.model === "string" ? request.model : undefined,
 		modelRole: policy.modelRole,
 		modelRoute: policy.modelRoute,
 		serviceTierOverride: policy.serviceTierOverride,
@@ -721,6 +777,7 @@ function buildFailureResult(
 			requests: 0,
 			modelOverride: policy.modelOverride,
 			modelRole: policy.modelRole,
+			resolvedModelRoute: policy.modelRoute,
 			error: message,
 		};
 	};
@@ -825,7 +882,8 @@ function describeSalvagedWork(result: SingleResult): string {
  * lease or child dispatch; callers keep responsibility for their result text.
  */
 export async function runStructuredSubagent(request: StructuredSubagentRequest): Promise<StructuredSubagentResult> {
-	const policy = await applySpawnHook(request, await resolveEffectiveSubagentPolicy(request));
+	const preflight = await resolveEffectiveSubagentPolicy(request);
+	const policy = await applySpawnHook(request, await applyAutoTaskModel(request, preflight));
 	const lease = await leaseArtifacts(request.session, request.invocationKind);
 	let changesApplied: boolean | null = null;
 	let mergeSummary = "";

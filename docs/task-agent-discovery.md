@@ -52,7 +52,7 @@ Parsing comes from frontmatter via `parseAgentFields()` (`src/discovery/helpers.
 
 OMP discovers user agents from `~/.omp/agent/agents/*.md` and project agents from `.omp/agents/*.md`.
 
-Give the agent a role alias in frontmatter, then dispatch it by name. For model routing, task dispatch sets only `agent`; it does not set a worker model:
+Give the agent a role alias in frontmatter, then dispatch it by name. The frontmatter model is used when automatic selection cannot select a usable role; pass `model` explicitly to pin the role for a task:
 
 `~/.omp/agent/agents/reviewer.md`:
 
@@ -83,6 +83,7 @@ With the default batched task schema, supply shared `context` and per-item `task
   "tasks": [
     {
       "agent": "reviewer",
+      "model": "@review",
       "task": "Report concrete correctness findings.",
       "solutionSpace": "Review cause and failure modes are open; no known defect."
     }
@@ -221,17 +222,23 @@ A missing name fails preflight with `Unknown agent "...". Available: ...`; no su
 
 ## Model and structured-output precedence
 
-For task dispatch, model precedence is:
+For ordinary task dispatch, model precedence is:
 
-1. `task.agentModelOverrides[agentName]`
-2. the agent frontmatter's prioritized `model` list
-3. the parent's active model, then its configured/default model fallback
+1. the task item's explicit `model` selector
+2. automatic role selection when `model` is omitted and a usable role is selected
+3. `task.agentModelOverrides[agentName]`
+4. the agent frontmatter's prioritized `model` list
+5. the parent's active model, then its configured/default model fallback
 
-Role aliases in either of the first two sources are expanded through `modelRoles`. The shared eval bridge can also supply an invocation-local model override ahead of the settings override; the task wire schema does not expose that field.
+Task accepts a per-item role (e.g. `@worker`) or `provider/model`; unknown or unavailable explicit selectors fail rather than inheriting an unrelated model. To pin a user-tagged model agent, also supply its listed selector as `model`. Automatic selection applies independently to each ordinary task item, including named agent types. Eval keeps its existing routing, and the bundled seance agent keeps its source-session model behavior.
 
-After policy resolution, the `before_subagent_spawn` extension hook runs once for the actual dispatch. It can block the spawn or replace the resolved model patterns; a routing note is carried into progress metadata.
+At actual dispatch, not preflight, the native Jev judge selects among configured, usable named model roles. The rubric favors `@haiku` for clearly bounded mechanical work, `@sonnet` for nontrivial, risky, ambiguous or uncertain work, and `@opus` for unusually difficult high-stakes work; other configured aliases are considered using their selector information, without assuming capabilities from their names. Built-in routing roles are not candidates. Both the winning probability and confidence must be at least 0.7. The judge receives the task, shared batch context if present, resolved agent type and candidate alias-to-selector map; each text field is bounded to 2,000 characters. This data is sent to the configured native judgment provider and may be cached in the shared judgment cache.
 
-The `Alt+P` task model pick is session-only; saving a model in `/agents` replaces that runtime selection for the current session and persists the new value for future sessions.
+The judgment has a four-second timeout. If native judgment is unavailable, fails, times out, is insufficiently confident, or cannot choose among at least two usable roles, routing falls back to `@sonnet` when that role is configured and usable. If no conservative role can be used, or the session has no model registry, the existing override/frontmatter/parent resolution is preserved. Caller cancellation propagates instead of triggering a fallback. The result and progress routing note identifies the chosen role, conservative fallback, or use of existing resolution; actual model selection may still change under authentication or retry fallback.
+
+After automatic selection, the `before_subagent_spawn` extension hook runs once for the actual dispatch. It can block any spawn, or replace model patterns when no explicit task model was supplied; a replacement and its routing note are reported. An explicit task selector cannot be replaced by the hook. Authentication and retry fallback policies remain in force; task results report the requested and actual model.
+
+The `Alt+P` task model pick is session-only; saving a model in `/agents` replaces that runtime selection for the current session and persists the new value for future sessions. These agent overrides apply when automatic selection does not pick a usable role.
 
 Compaction triggers are separate from model and service-tier selection: an exact, case-sensitive
 `task.agentCompactionThresholdOverrides[agentName]` entry (`90000` or `"80%"`) replaces the

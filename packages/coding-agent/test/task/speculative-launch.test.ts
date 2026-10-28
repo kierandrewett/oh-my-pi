@@ -190,6 +190,18 @@ describe("task speculative launch", () => {
 		expect(manager.getJob("Beta")!.status).toBe("completed");
 	});
 
+	it("does not adopt an early launch if its model selector changes", async () => {
+		const { session } = await openSession();
+		session.update(toolCall, '{"context":"ctx","tasks":[{"name":"Alpha","agent":"task","task":"Do A.","model":"provider/first"},');
+		await spawn("Alpha").started.promise;
+		const changed = { context: "ctx", tasks: [
+			{ name: "Alpha", agent: "task", task: "Do A.", model: "provider/second" },
+		] };
+		expect(session.matchesFinalArgs(changed)).toBe(false);
+		session.finalize({ toolCall, args: changed });
+		await spawn("Alpha").aborted.promise;
+	});
+
 	it("aborts launched agents when the finished call is invalid", async () => {
 		const { session } = await openSession();
 		session.update(toolCall, alphaClosed);

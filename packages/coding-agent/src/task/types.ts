@@ -48,15 +48,14 @@ const effortRule = '"lo" | "med" | "hi"' as const;
 // Seance-only per-spawn fields the task tool refuses for every other agent.
 // Typed against SeanceTaskSchemaFields so a field added there fails to compile
 // until it is listed here too; a missed key would be dropped on batch items.
-const SEANCE_ITEM_KEY_SET = { sourceSession: true, model: true } as const satisfies Record<SeanceItemKey, true>;
+const SEANCE_ITEM_KEY_SET = { sourceSession: true } as const satisfies Record<SeanceItemKey, true>;
 const SEANCE_ITEM_KEYS = Object.keys(SEANCE_ITEM_KEY_SET);
 
 /**
  * Keep a batch item's seance-only keys through undeclared-key deletion: the
  * item schema declares them only while seance is advertised. Argument
- * validation re-attaches only root keys, so without this a `tasks[].model` pin
- * on an ordinary agent is deleted before execute() and the child silently runs
- * on its own model, while the flat form's root `model` reaches the refusal.
+ * validation re-attaches only root keys, so sourceSession must be retained for
+ * runtime rejection on ordinary agents even when seance is hidden.
  * Other stale item keys are still deleted, and the wire schema is unchanged.
  */
 function keepSeanceItemKeys<T, I>(item: FluentType<T, I>): FluentType<unknown, I> {
@@ -72,6 +71,7 @@ function keepSeanceItemKeys<T, I>(item: FluentType<T, I>): FluentType<unknown, I
 
 export const taskItemSchema = type({
 	"name?": "string",
+	"model?": "string",
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
@@ -82,6 +82,7 @@ export const taskItemSchema = type({
 });
 const taskItemSchemaIsolated = type({
 	"name?": "string",
+	"model?": "string",
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
@@ -94,6 +95,7 @@ const taskItemSchemaIsolated = type({
 
 export const taskSchema = type({
 	"name?": "string",
+	"model?": "string",
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
@@ -105,6 +107,7 @@ export const taskSchema = type({
 });
 const taskSchemaNoIsolation = type({
 	"name?": "string",
+	"model?": "string",
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
@@ -117,8 +120,13 @@ function guardBatchAgent(schema: BaseType): BaseType {
 	// Inspect the input before undeclared-key deletion can erase the requested agent.
 	return schema.in
 		.narrow((params, ctx) => {
-			if (params !== null && typeof params === "object" && Object.hasOwn(params, "agent")) {
-				return ctx.reject("a batch with `agent` specified in `tasks[].agent`, not at the top level");
+			if (params !== null && typeof params === "object") {
+				if (Object.hasOwn(params, "agent")) {
+					return ctx.reject("a batch with `agent` specified in `tasks[].agent`, not at the top level");
+				}
+				if (Object.hasOwn(params, "model")) {
+					return ctx.reject("a batch with `model` specified in `tasks[].model`, not at the top level");
+				}
 			}
 			return true;
 		})
@@ -160,7 +168,6 @@ function taskAgentSchemaRule(defaultAgent: string): string {
 /** Seance-only task fields; `seanceTaskSchemaFields` in ./seance must match it exactly. */
 export type SeanceTaskSchemaFields = {
 	"sourceSession?"?: FluentType<string>;
-	"model?"?: FluentType<string | string[]>;
 };
 
 type SeanceItemKey = {
@@ -183,10 +190,12 @@ function createTaskSchema(options: {
 		: {};
 	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
 	const seanceFields = options.seanceFields;
+	const model = seanceFields["sourceSession?"] ? type("string | string[]") : type("string");
 	if (options.batchEnabled) {
 		if (options.isolationEnabled) {
 			const item = type.raw({
 				"name?": "string",
+				"model?": model,
 				agent,
 				task: "string",
 				solutionSpace: "string",
@@ -207,6 +216,7 @@ function createTaskSchema(options: {
 		}
 		const item = type.raw({
 			"name?": "string",
+			"model?": model,
 			agent,
 			task: "string",
 			solutionSpace: "string",
@@ -227,6 +237,7 @@ function createTaskSchema(options: {
 	if (options.isolationEnabled) {
 		return type.raw({
 			"name?": "string",
+			"model?": model,
 			agent,
 			task: "string",
 			solutionSpace: "string",
@@ -240,6 +251,7 @@ function createTaskSchema(options: {
 	}
 	return type.raw({
 		"name?": "string",
+		"model?": model,
 		agent,
 		task: "string",
 		solutionSpace: "string",
@@ -261,7 +273,7 @@ export function getTaskSchema(options: {
 	/** Advertise `outputSchema`/`schemaMode` (`task.structured`); default on. */
 	structured?: boolean;
 	defaultAgent?: string;
-	/** Advertise historical source/model fields for the bundled seance agent. */
+	/** Advertise the historical source field and selector arrays for the bundled seance agent. */
 	seanceFields?: SeanceTaskSchemaFields;
 }): TaskToolSchemaInstance {
 	const defaultAgent = options.defaultAgent ?? "task";

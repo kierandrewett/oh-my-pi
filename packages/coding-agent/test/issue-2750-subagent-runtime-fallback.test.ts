@@ -110,6 +110,20 @@ describe("subagent runtime model resolution", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("fails an unresolved explicit task model instead of starting a default session", async () => {
+		const createSession = vi.spyOn(sdkModule, "createAgentSession");
+		const result = await runSubprocess({
+			cwd: "/tmp", agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "work", index: 0, id: "missing-model", modelOverride: ["missing/model"],
+			explicitModel: "missing/model", settings: Settings.isolated({}),
+			modelRegistry: { getAvailable: () => [model("provider", "default")], getApiKey: async () => "key" } as never,
+			enableLsp: false,
+		});
+		expect(result.exitCode).not.toBe(0);
+		expect(result.error).toContain("missing/model");
+		expect(createSession).not.toHaveBeenCalled();
+	});
+
 	for (const { level, collide } of [
 		{ level: undefined, collide: false },
 		{ level: ThinkingLevel.High, collide: false },

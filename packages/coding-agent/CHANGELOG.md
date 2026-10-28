@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Select a model role or model independently for each task subagent, including mixed-model batches.
+- Automatically select a configured model role for task subagents without an explicit model, with a conservative fallback and visible routing notes.
+
 ## [18.13.2] - 2026-10-27
 
 ### Added

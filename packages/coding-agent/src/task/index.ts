@@ -1799,6 +1799,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				execution.policy.discovery.projectAgentsDir,
 				Date.now() - startTime,
 				execution.mergeSummary,
+				params.model,
 			);
 		} catch (error) {
 			const message = error instanceof StructuredSubagentError ? error.message : String(error);
@@ -1811,7 +1812,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? { ...settled, error: settled.error ?? (cause instanceof Error ? cause.message : message) }
 				: undefined;
 			return {
-				content: [{ type: "text", text: `Task execution failed: ${message}` }],
+				content: [{
+					type: "text",
+					text: salvaged
+						? `Task execution failed: ${message}\n\n${formatTaskResultSummary(salvaged, { totalDurationMs: Date.now() - startTime, requestedModel: params.model })}`
+						: `Task execution failed: ${message}`,
+				}],
 				isError: true,
 				details: {
 					projectAgentsDir: null,
@@ -1831,10 +1837,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		projectAgentsDir: string | null,
 		totalDurationMs: number,
 		mergeSummary: string,
+		requestedModel?: string | string[],
 	): AgentToolResult<TaskToolDetails> {
-		const summary = formatTaskResultSummary(result, { totalDurationMs, mergeSummary });
+		const summary = formatTaskResultSummary(result, { totalDurationMs, mergeSummary, requestedModel });
 		return {
 			content: [{ type: "text", text: summary }],
+			...(requestedModel !== undefined && (result.exitCode !== 0 || result.error) ? { isError: true } : {}),
 			details: {
 				projectAgentsDir,
 				results: [result],

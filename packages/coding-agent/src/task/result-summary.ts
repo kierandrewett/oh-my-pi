@@ -51,7 +51,7 @@ function previewHead(output: string): string {
 /** Render the `<task-result>` envelope for a settled run. */
 export function formatTaskResultSummary(
 	result: SingleResult,
-	options: { totalDurationMs: number; mergeSummary?: string },
+	options: { totalDurationMs: number; mergeSummary?: string; requestedModel?: string | string[] },
 ): string {
 	const status = result.aborted
 		? "cancelled"
@@ -76,6 +76,10 @@ export function formatTaskResultSummary(
 			agentName: result.agent,
 			id: result.id,
 			status,
+			requestedModel: options.requestedModel ? escapeHarnessTags(Array.isArray(options.requestedModel) ? options.requestedModel.join(", ") : options.requestedModel) : undefined,
+			model: result.resolvedModel ? escapeHarnessTags(result.resolvedModel) : undefined,
+			modelFallback: result.resolvedModelIsFallback,
+			modelRoute: result.resolvedModelRoute ? escapeHarnessTags(result.resolvedModelRoute) : undefined,
 			duration: formatDuration(options.totalDurationMs),
 			abortReason: result.aborted ? escapeHarnessTags(result.abortReason ?? "") || undefined : undefined,
 			error: error === undefined ? undefined : escapeHarnessTags(error),
