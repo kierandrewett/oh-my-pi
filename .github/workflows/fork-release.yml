@@ -48,8 +48,13 @@ jobs:
       - name: Apply complete fork patch series
         run: bash tracker/scripts/fork/apply-patches.sh "$GITHUB_WORKSPACE/tracker" "$GITHUB_WORKSPACE/upstream"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-      - name: Install Bazelisk
-        run: npm install --global @bazel/bazelisk
+      - name: Prepare Bazelisk
+        run: |
+          set -euo pipefail
+          if ! command -v bazel >/dev/null; then
+            npm install --prefix "$RUNNER_TEMP/bazelisk" @bazel/bazelisk
+            echo "$RUNNER_TEMP/bazelisk/node_modules/.bin" >> "$GITHUB_PATH"
+          fi
       - name: Install upstream dependencies
         working-directory: upstream
         run: bun install --frozen-lockfile
