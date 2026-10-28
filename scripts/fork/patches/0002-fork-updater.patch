@@ -1,0 +1,741 @@
+From bde4494f4935a51e851ddf901ede68805f4cb4a7 Mon Sep 17 00:00:00 2001
+From: kierandrewett <kieran@drewett.dev>
+Date: Wed, 28 Oct 2026 00:55:05 +0000
+Subject: [PATCH] feat(update): use fork GitHub releases
+
+Fetch and verify fork release binaries and prevent package-managed installations from updating back to upstream. Preserve standalone update rollback and use fork-aware version ordering.
+
+Validated with 31 focused updater tests and coding-agent type checking; release integration remains to be exercised.
+---
+ docs/environment-variables.md                 |   2 +-
+ packages/coding-agent/CHANGELOG.md            |   4 +
+ packages/coding-agent/README.md               |  17 +++
+ .../coding-agent/src/cli/build-service.ts     | 116 ++++++---------
+ packages/coding-agent/src/cli/update-cli.ts   |  77 +++++-----
+ packages/coding-agent/src/main.ts             |   7 +-
+ .../test/cli/build-service.test.ts            | 132 +++++++++++-------
+ .../coding-agent/test/cli/update-cli.test.ts  | 115 +++++++++++----
+ 8 files changed, 278 insertions(+), 192 deletions(-)
+
+diff --git a/docs/environment-variables.md b/docs/environment-variables.md
+index dd0fe1142d..ed179a4438 100644
+--- a/docs/environment-variables.md
++++ b/docs/environment-variables.md
+@@ -577,7 +577,7 @@ These affect where coding-agent stores data and which process-local settings ove
+ | `PWD`                                               | Used when matching canonical current working directory in path helpers                                                     |
+ | `OMP_WORKTREE_DIR`                                  | Agent-managed worktrees directory override (default `~/.omp/wt`); must be absolute or `~`-relative, relative paths are ignored; wins over the `worktree.base` setting                      |
+ | `OMP_GITHUB_CACHE_DB`                               | Overrides the GitHub view cache database path (default `~/.omp/cache/github-cache.db`)                                                                                                     |
+-| `PI_BUILD_URL`                                      | Origin of the build service standalone binaries come from (default `https://build.stencil.so`; trailing slashes are trimmed). `omp update` on a binary install, the binary takeover of a binary-only release, and a compiled binary's startup update check ask `<origin>/api/products/omp/latest/<target>?channel=stable\|canary`; downloads are verified against the answer's size and SHA-256, from a patch against the installed binary when one is offered. The install scripts (`install.sh`, `install.ps1`) download from the same origin |
++| `PI_BUILD_URL`                                      | Upstream installer/build-service override; fork `omp update` and startup checks ignore it and use GitHub fork releases instead |
+ | `PI_GRAMMARS_URL`                                   | Base URL for on-demand WebAssembly tree-sitter grammars (default `https://github.com/stencil-hq/wasm-grammars/releases/download`); assets are fetched as `<base>/<release>/<file>.zst` and verified against the addon's pinned SHA-256 before landing in `<natives dir>/grammars` (`~/.omp/natives/grammars`) |
+ 
+ ---
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index 353adf7e0e..8d7a9137d6 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -7,6 +7,10 @@
+ - Select a model role or model independently for each task subagent, including mixed-model batches.
+ - Automatically select a configured model role for task subagents without an explicit model, with a conservative fallback and visible routing notes.
+ 
++### Changed
++
++- Standalone updates download and verify releases from the fork's GitHub repository.
++
+ ## [18.13.2] - 2026-10-27
+ 
+ ### Added
+diff --git a/packages/coding-agent/README.md b/packages/coding-agent/README.md
+index e749b40f5a..bcd9df0016 100644
+--- a/packages/coding-agent/README.md
++++ b/packages/coding-agent/README.md
+@@ -13,6 +13,23 @@ Package-specific references:
+ - [MCP server/tool authoring](../../docs/mcp-server-tool-authoring.md)
+ - [DEVELOPMENT](./DEVELOPMENT.md)
+ 
++## Fork releases and updates
++
++This fork publishes standalone binaries at [kierandrewett/oh-my-pi releases](https://github.com/kierandrewett/oh-my-pi/releases). `omp update` and startup checks use the latest stable fork release, not the upstream npm registry or build service. Releases are named `v<upstream-version>-fork.<revision>`; the embedded version has the same suffix. The updater verifies the release asset's SHA-256 and size before replacing the binary, and restores the previous binary if version verification fails. Canary releases are not provided; use `omp update --stable` if the stored channel is canary. A platform without a matching release asset fails rather than falling back to an upstream binary.
++
++The fork does not publish npm packages, a Homebrew formula, or a mise package. The fork updater will not upgrade or overwrite an npm, bun, Homebrew, mise, or Nix-managed installation; `omp update --check` checks the fork release and a normal update reports that an explicit migration is required. **An already-installed upstream executable still has its original updater**; do not run it to migrate.
++
++To migrate a Linux glibc x64 install explicitly, install the fork binary separately, leaving the managed installation intact. For example, with the GitHub CLI and `sha256sum` installed:
++
++```sh
++mkdir -p ~/.local/bin
++workdir=$(mktemp -d)
++gh release download --repo kierandrewett/oh-my-pi --dir "$workdir" --pattern omp-linux-x64 --pattern SHA256SUMS.txt
++(cd "$workdir" && grep '  omp-linux-x64$' SHA256SUMS.txt | sha256sum -c -) && install -m 755 "$workdir/omp-linux-x64" ~/.local/bin/omp
++```
++
++Check the checksum command succeeds before installing, and ensure `~/.local/bin` precedes the old manager's bin directory in `PATH`. The `install` command replaces any existing `~/.local/bin/omp`; back it up first if necessary. Verify the selected executable with `command -v omp` and `omp --version`. Roll back by restoring that backup or removing the separately installed fork binary and selecting the original managed launcher on `PATH`. Do not uninstall the old package until you no longer need that rollback path; package-manager cleanup may remove manager-owned launchers. Configuration and credentials are unchanged. Release checksums detect corrupted downloads but are not independent signatures.
++
+ ## Memory backends
+ 
+ The agent supports three mutually-exclusive memory backends, selected via the `memory.backend` setting (Settings → Memory tab, or `~/.omp/config.yml`):
+diff --git a/packages/coding-agent/src/cli/build-service.ts b/packages/coding-agent/src/cli/build-service.ts
+index 4ba1d4d2ac..4ead2d537d 100644
+--- a/packages/coding-agent/src/cli/build-service.ts
++++ b/packages/coding-agent/src/cli/build-service.ts
+@@ -1,31 +1,4 @@
+-/**
+- * Client for Stencil's build service, the source of omp's standalone binaries.
+- *
+- * `omp update` on a standalone binary install, the binary takeover of a
+- * package-manager install, and the startup update check of a compiled binary
+- * all ask the service which build to install ({@link fetchBuild}):
+- *
+- * - `GET {origin}/api/products/omp/latest/{target}?channel=stable|canary` for
+- *   the newest build on a channel;
+- * - `GET {origin}/api/products/omp/versions/{version}/{target}` for one exact
+- *   version.
+- *
+- * omp is a public product, so no token is sent. The origin is `PI_BUILD_URL`
+- * ({@link DEFAULT_BUILD_URL} when unset). `{target}` is
+- * `{macos|linux|linux-musl|windows}-{arm64|x86_64}` ({@link resolveBuildHost}).
+- * Requests carry `User-Agent: omp/<version>`, which the service counts in its
+- * update-check statistics.
+- *
+- * Adding `from_version=<installed version>` makes the answer carry an
+- * HDiffPatch patch from that version's file to the answered one when the
+- * service has it; when it does not yet, the service starts making it
+- * (`patch_pending`) so a later check finds it.
+- *
+- * An answer is checked before anything in it is used ({@link parseBuildAnswer}):
+- * a malformed answer is an error, a malformed `patch` is dropped so the whole
+- * file still installs. `404 {"error":"no_build"}` means nothing is published
+- * for the target (on the channel, or at the version).
+- */
++/** Fork release discovery and shared build metadata types for the updater. */
+ import * as fs from "node:fs";
+ import { $env, APP_NAME, isRecord, VERSION } from "@oh-my-pi/pi-utils";
+ import { $ } from "bun";
+@@ -44,7 +17,7 @@ export type Fetch = (input: string | URL | Request, init?: RequestInit) => Promi
+ export const DEFAULT_BUILD_URL = "https://build.stencil.so";
+ 
+ /** The product omp's builds are published under. */
+-const PRODUCT = "omp";
++const FORK_REPOSITORY = "kierandrewett/oh-my-pi";
+ 
+ const BUILD_CHECK_TIMEOUT_MS = 30_000;
+ 
+@@ -246,58 +219,51 @@ export interface FetchBuildOptions {
+ 	host?: BuildHost;
+ }
+ 
+-/** Ask the build service for a build of this host's target ({@link BuildSelector}). */
++/** Fetch a stable fork release and verify its platform-specific checksum metadata. */
+ export async function fetchBuild(selector: BuildSelector, options: FetchBuildOptions = {}): Promise<BuildAnswer> {
++	if ("channel" in selector && selector.channel !== "stable") {
++		throw new Error("The fork publishes stable releases only; use --stable.");
++	}
+ 	const host = options.host ?? (await currentBuildHost());
+-	const origin = buildServiceUrl();
+ 	const timeoutMs = options.timeoutMs ?? BUILD_CHECK_TIMEOUT_MS;
+-	const route =
+-		"channel" in selector
+-			? `latest/${host.target}`
+-			: `versions/${encodeURIComponent(selector.version)}/${host.target}`;
+-	const url = new URL(`${origin}/api/products/${PRODUCT}/${route}`);
+-	if ("channel" in selector) url.searchParams.set("channel", selector.channel);
+-	if (options.fromVersion) url.searchParams.set("from_version", options.fromVersion);
+-	const what = `${APP_NAME} ${"channel" in selector ? `${selector.channel} build` : `build ${selector.version}`} for ${host.target}`;
+-
+-	const mapError = (err: unknown): unknown => {
+-		if (isTimeoutError(err)) {
+-			return new Error(`Timed out asking ${origin} for the ${what} after ${Math.round(timeoutMs / 1000)}s`, {
+-				cause: err,
+-			});
+-		}
+-		if (isUnsupportedProxyError(err)) return new Error(unsupportedProxyMessage(), { cause: err });
+-		return err;
+-	};
+-
+-	let response: Response;
+-	let body: unknown;
+-	try {
+-		response = await (options.fetchImpl ?? fetch)(url, {
+-			headers: { Accept: "application/json", "User-Agent": `${APP_NAME}/${VERSION}` },
+-			signal: withTimeoutSignal(timeoutMs),
+-		});
++	const fetchImpl = options.fetchImpl ?? fetch;
++	const api = `https://api.github.com/repos/${FORK_REPOSITORY}/releases`;
++	const route = "version" in selector ? `/tags/${encodeURIComponent(`v${selector.version}`)}` : "/latest";
++	const request = async (url: string, accept: string): Promise<Response> => {
+ 		try {
+-			body = await response.json();
++			const response = await fetchImpl(url, {
++				headers: { Accept: accept, "User-Agent": `${APP_NAME}/${VERSION}` },
++				signal: withTimeoutSignal(timeoutMs),
++			});
++			if (!response.ok) throw new Error(`GitHub release request failed: ${response.status} ${response.statusText}`);
++			return response;
+ 		} catch (err) {
+-			// A malformed body is reported below; body-read timeouts and resets surface.
+-			if (!(err instanceof SyntaxError)) throw err;
++			if (isTimeoutError(err)) throw new Error("Timed out fetching fork release metadata", { cause: err });
++			if (isUnsupportedProxyError(err)) throw new Error(unsupportedProxyMessage(), { cause: err });
++			throw err;
+ 		}
+-	} catch (err) {
+-		throw mapError(err);
+-	}
+-
+-	if (response.status === 404 && isRecord(body) && body.error === "no_build") {
+-		const hint =
+-			"channel" in selector && selector.channel === "canary" ? ` Try \`${APP_NAME} update --stable\`.` : "";
+-		throw new Error(`No ${what} is published on ${origin} yet.${hint}`);
+-	}
+-	if (!response.ok) {
+-		throw new Error(`${origin} answered ${response.status} ${response.statusText} for the ${what}`);
++	};
++	const release: unknown = await (await request(`${api}${route}`, "application/vnd.github+json")).json();
++	if (!isRecord(release) || release.draft !== false || release.prerelease !== false ||
++		typeof release.tag_name !== "string" || !/^v\d+\.\d+\.\d+-fork\.[1-9]\d*$/.test(release.tag_name) ||
++		!Array.isArray(release.assets)) {
++		throw new Error("Invalid stable fork release metadata");
+ 	}
+-	try {
+-		return parseBuildAnswer(body, host.fileName, options.fromVersion);
+-	} catch (err) {
+-		throw new Error(`Invalid answer from ${origin} for the ${what}: ${err instanceof Error ? err.message : err}`);
++	const version = release.tag_name.slice(1);
++	if ("version" in selector && selector.version !== version) throw new Error("Fork release version mismatch");
++	const asset = release.assets.filter((entry: unknown) => isRecord(entry) && entry.name === host.fileName);
++	const sums = release.assets.filter((entry: unknown) => isRecord(entry) && entry.name === "SHA256SUMS.txt");
++	if (asset.length !== 1 || sums.length !== 1 || !isRecord(asset[0]) || !isSize(asset[0].size)) {
++		throw new Error(`Fork release does not contain exactly one ${host.fileName} and SHA256SUMS.txt`);
+ 	}
++	const base = `https://github.com/${FORK_REPOSITORY}/releases/download/${encodeURIComponent(release.tag_name)}`;
++	const checksumText = await (await request(`${base}/SHA256SUMS.txt`, "text/plain")).text();
++	const matches = checksumText.split(/\r?\n/).map(line => /^([0-9a-fA-F]{64}) [ *](.+)$/.exec(line))
++		.filter(match => match?.[2] === host.fileName);
++	if (matches.length !== 1 || !matches[0]) throw new Error(`Missing or ambiguous SHA-256 for ${host.fileName}`);
++	return {
++		version,
++		file: { name: host.fileName, size: asset[0].size, sha256: matches[0][1].toLowerCase() },
++		download: `${base}/${encodeURIComponent(host.fileName)}`,
++	};
+ }
+diff --git a/packages/coding-agent/src/cli/update-cli.ts b/packages/coding-agent/src/cli/update-cli.ts
+index 8fbee0cd57..61d3827ae6 100644
+--- a/packages/coding-agent/src/cli/update-cli.ts
++++ b/packages/coding-agent/src/cli/update-cli.ts
+@@ -34,7 +34,6 @@ import {
+ import { type BuildAnswer, type BuildPatch, type Fetch, fetchBuild, type UpdateChannel } from "./build-service";
+ import {
+ 	DEFAULT_NPM_REGISTRY,
+-	loadNpmRegistryResolver,
+ 	type NpmRegistry,
+ 	type NpmRegistryResolver,
+ 	npmRegistryPackageUrl,
+@@ -190,7 +189,7 @@ export interface VerifiedBinaryDownloadOptions {
+ }
+ 
+ /**
+- * Download a file and verify its build-service-reported size and SHA-256
++ * Download a file and verify its release-reported size and SHA-256
+  * digest (`sha256:<hex>`), leaving it executable. Nothing is left at
+  * `targetPath` when the download fails or does not match.
+  */
+@@ -789,22 +788,21 @@ async function fetchLatestManifest(
+ }
+ 
+ /**
+- * Get the latest release info from the npm registry, following `omp.rename`
+- * pointers ({@link resolveReleaseRename}) when the package has moved to a new
+- * npm name. Version, dist, and install names all come from the final manifest
+- * in the chain. This is the version source of package-manager installs (bun,
+- * npm, Homebrew, mise, Nix); standalone binaries ask the build service
+- * ({@link fetchBuild}) instead.
+- *
+- * The registry comes from the user's npm/bun configuration
+- * ({@link loadNpmRegistryResolver}), so a configured feed is honored.
++ * Get the fork release for startup checks. An explicitly supplied registry
++ * resolver supports callers that need to inspect an npm manifest directly.
+  */
+ export async function getLatestRelease(
+ 	options: { timeoutMs?: number; channel?: UpdateChannel; registries?: NpmRegistryResolver } = {},
+ ): Promise<ReleaseInfo> {
+ 	const timeoutMs = options.timeoutMs ?? RELEASE_METADATA_TIMEOUT_MS;
+ 	const channel = options.channel ?? "stable";
+-	const registries = options.registries ?? (await loadNpmRegistryResolver());
++	// The fork does not publish an npm package. Startup checks must use the
++	// same fork release as the binary updater, not the upstream registry.
++	if (!options.registries) {
++		const build = await fetchBuild({ channel }, { timeoutMs });
++		return { tag: `v${build.version}`, version: build.version, dist: "binary", packages: CURRENT_PACKAGES, registry: "" };
++	}
++	const registries = options.registries;
+ 	const packages: ReleasePackages = { ...CURRENT_PACKAGES };
+ 	const visited = new Set([packages.pkg]);
+ 	let registry = registries(packages.pkg);
+@@ -2086,9 +2084,7 @@ export async function updateViaShimTakeover(
+  * a user recovering from a binary-only release straight back through bun.
+  */
+ function installerHint(): string {
+-	return process.platform === "win32"
+-		? "& ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary"
+-		: "curl -fsSL https://omp.sh/install | sh -s -- --binary";
++	return "https://github.com/kierandrewett/oh-my-pi/releases";
+ }
+ 
+ /** Persisted channel, or undefined when settings are unavailable (SDK/test embedding without `Settings.init()`). */
+@@ -2123,13 +2119,25 @@ interface UpdateRequest {
+ 	persistChannel: boolean;
+ }
+ 
++/** Compare upstream cores first, then fork revisions; a fork supersedes its upstream base. */
++export function compareForkVersions(offered: string, current: string): number {
++	const parse = (version: string): { core: string; revision: string } | undefined => {
++		const match = /^(\d+\.\d+\.\d+)(?:-fork\.([1-9]\d*))?$/.exec(version);
++		return match ? { core: match[1], revision: match[2] ?? "0" } : undefined;
++	};
++	const a = parse(offered);
++	const b = parse(current);
++	if (!a || !b) return compareVersions(offered, current);
++	return compareVersions(a.core, b.core) || compareVersions(a.revision, b.revision);
++}
++
+ /**
+  * Print how the offered `version` relates to the running build. Returns false
+  * when there is nothing to install: not newer, and neither `--force` nor a
+  * channel switch asks for it.
+  */
+ function announceOffer(version: string, request: UpdateRequest): boolean {
+-	const comparison = compareVersions(version, VERSION);
++	const comparison = compareForkVersions(version, VERSION);
+ 	if (comparison <= 0 && !request.force && !request.isChannelSwitch) {
+ 		const icon = theme?.status?.success ?? "✔";
+ 		console.log(chalk.green(`${icon} Already up to date`));
+@@ -2150,9 +2158,7 @@ function announceOffer(version: string, request: UpdateRequest): boolean {
+ }
+ 
+ /**
+- * Update a standalone binary install from the build service: the newest build
+- * on the channel, asked with the installed version so the answer can carry a
+- * patch from it. npm is never consulted.
++ * Update a standalone binary from the fork release, never the npm registry.
+  */
+ async function runBinaryUpdate(
+ 	target: BinaryUpdateTarget | undefined,
+@@ -2276,12 +2282,8 @@ async function runManagedUpdate(
+ }
+ 
+ /**
+- * Run the update command.
+- *
+- * The installer that owns the PATH `omp` decides where the version comes
+- * from: a standalone binary asks the build service, a package-manager install
+- * asks npm. When no target resolves, the running build's kind decides, so
+- * `--check` still answers; installing then fails on the unresolved target.
++ * Check the stable fork release. Only standalone binaries are updated in
++ * place; package-managed installs must be migrated explicitly.
+  */
+ export async function runUpdateCommand(opts: {
+ 	force: boolean;
+@@ -2317,12 +2319,21 @@ export async function runUpdateCommand(opts: {
+ 	} catch (err) {
+ 		targetError = err;
+ 	}
+-	if (target?.method === "binary") {
+-		await runBinaryUpdate(target, targetError, request);
+-	} else if (!target && isCompiledBinary()) {
+-		await runBinaryUpdate(undefined, targetError, request);
+-	} else {
+-		await runManagedUpdate(target, targetError, request);
++	if (target?.method === "binary" || (!target && isCompiledBinary())) {
++		await runBinaryUpdate(target?.method === "binary" ? target : undefined, targetError, request);
++		return;
++	}
++	// Package managers own their launchers and upstream packages. Never ask
++	// them to upgrade this fork or silently replace a managed installation.
++	try {
++		const build = await fetchBuild({ channel: request.channel });
++		announceOffer(build.version, request);
++		console.log(chalk.yellow("This installation is package-managed or not a standalone binary; it was not changed."));
++		console.log(chalk.dim("To migrate explicitly, install a verified fork release binary separately: https://github.com/kierandrewett/oh-my-pi/releases"));
++		if (!request.check) process.exitCode = 1;
++	} catch (err) {
++		console.error(chalk.red(`Failed to check fork releases: ${err}`));
++		process.exitCode = 1;
+ 	}
+ }
+ 
+@@ -2339,7 +2350,7 @@ ${chalk.bold("Options:")}
+   -c, --check     Check for updates without installing
+   -f, --force     Force reinstall even if up to date
+   -l, --plugins   Update installed plugins
+-  --canary        Switch to the canary channel and update
++  --canary        Unsupported (fork releases are stable only)
+   --stable        Switch back to the stable channel
+ 
+ ${chalk.bold("Examples:")}
+@@ -2347,6 +2358,6 @@ ${chalk.bold("Examples:")}
+   ${APP_NAME} update --check      Check if updates are available
+   ${APP_NAME} update --force      Force reinstall
+   ${APP_NAME} update -l           Update installed plugins
+-  ${APP_NAME} update --canary    Switch to the canary channel and update
++  ${APP_NAME} update --stable    Use stable fork releases
+ `);
+ }
+diff --git a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
+index b263141f5c..5aa311b130 100644
+--- a/packages/coding-agent/src/main.ts
++++ b/packages/coding-agent/src/main.ts
+@@ -44,7 +44,7 @@ import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
+ import type { SessionPickerOptions } from "@oh-my-pi/pi-tui/apps/session-picker";
+ import { fetchBuild } from "./cli/build-service";
+ import { applyStartupCwd } from "./cli/startup-cwd";
+-import { getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
++import { compareForkVersions, getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
+ import { findConfigFile } from "./config";
+ import { ModelRegistry } from "./config/model-registry";
+ import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
+@@ -264,12 +264,11 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
+ 		// "run omp update" would be wrong advice for both.
+ 		if (isSourceCheckout() || (await managedInstallName(process.execPath))) return;
+ 		const channel = cfgUpdateChannel.get(settings);
+-		// A compiled binary updates from the build service; naming the running
+-		// version lets the service prepare the patch `omp update` will then use.
++		// Both paths check the same stable fork release as `omp update`.
+ 		const { version } = isCompiledBinary()
+ 			? await fetchBuild({ channel }, { timeoutMs: 5_000, fromVersion: currentVersion })
+ 			: await getLatestRelease({ timeoutMs: 5_000, channel });
+-		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
++		return compareForkVersions(version, currentVersion) > 0 ? version : undefined;
+ 	} catch {
+ 		return undefined;
+ 	}
+diff --git a/packages/coding-agent/test/cli/build-service.test.ts b/packages/coding-agent/test/cli/build-service.test.ts
+index 776133bd5c..44fd532306 100644
+--- a/packages/coding-agent/test/cli/build-service.test.ts
++++ b/packages/coding-agent/test/cli/build-service.test.ts
+@@ -1,4 +1,4 @@
+-import { afterEach, describe, expect, it } from "bun:test";
++import { describe, expect, it } from "bun:test";
+ import {
+ 	type BuildHost,
+ 	fetchBuild,
+@@ -115,68 +115,94 @@ describe("build service targets", () => {
+ 	});
+ });
+ 
+-describe("fetchBuild", () => {
++describe("fetchBuild fork releases", () => {
+ 	const host: BuildHost = { target: "macos-arm64", fileName };
+-	const previousUrl = process.env.PI_BUILD_URL;
+-
+-	afterEach(() => {
+-		if (previousUrl === undefined) delete process.env.PI_BUILD_URL;
+-		else process.env.PI_BUILD_URL = previousUrl;
++	const api = "https://api.github.com/repos/kierandrewett/oh-my-pi/releases";
++	const tag = "v18.8.9-fork.2";
++	const download = `https://github.com/kierandrewett/oh-my-pi/releases/download/${tag}`;
++	const release = {
++		tag_name: tag,
++		draft: false,
++		prerelease: false,
++		assets: [{ name: fileName, size: 42 }, { name: "SHA256SUMS.txt" }],
++	};
++	const checksum = `${sha("new").toUpperCase()}  ${fileName}\n`;
++
++	it("uses the stable GitHub release and checksum to offer the host binary", async () => {
++		const requests: Array<{ url: string; accept: string | null; userAgent: string | null; signal: AbortSignal | null | undefined }> = [];
++		const build = await fetchBuild({ channel: "stable" }, {
++			host,
++			fromVersion: "18.8.8",
++			fetchImpl: async (input, init) => {
++				const url = String(input);
++				requests.push({ url, accept: new Headers(init?.headers).get("Accept"), userAgent: new Headers(init?.headers).get("User-Agent"), signal: init?.signal });
++				return url === `${api}/latest` ? Response.json(release) : new Response(checksum);
++			},
++		});
++		expect(requests.map(request => [request.url, request.accept])).toEqual([
++			[`${api}/latest`, "application/vnd.github+json"],
++			[`${download}/SHA256SUMS.txt`, "text/plain"],
++		]);
++		for (const request of requests) {
++			expect(request.userAgent).toBe(`omp/${VERSION}`);
++			expect(request.signal).toBeInstanceOf(AbortSignal);
++		}
++		expect(build).toEqual({
++			version: "18.8.9-fork.2",
++			file: { name: fileName, size: 42, sha256: sha("new") },
++			download: `${download}/${fileName}`,
++		});
+ 	});
+ 
+-	it("asks the configured origin for the channel's newest build, naming the installed version", async () => {
+-		process.env.PI_BUILD_URL = "https://build.test/";
+-		const requests: Array<{ url: string; userAgent: string | null; signal: AbortSignal | null | undefined }> = [];
++	it("requests an exact fork version and rejects a different returned tag", async () => {
++		const urls: string[] = [];
++		const fetchImpl = async (input: string | URL | Request) => {
++			const url = String(input);
++			urls.push(url);
++			return url.startsWith(api) ? Response.json(release) : new Response(checksum);
++		};
++		await fetchBuild({ version: "18.8.9-fork.2" }, { host, fetchImpl });
++		expect(urls[0]).toBe(`${api}/tags/${tag}`);
++		await expect(fetchBuild({ version: "18.8.9-fork.1" }, { host, fetchImpl })).rejects.toThrow("version mismatch");
++	});
+ 
+-		const build = await fetchBuild(
+-			{ channel: "canary" },
+-			{
+-				host,
+-				fromVersion: "18.8.8",
+-				fetchImpl: async (input, init) => {
+-					requests.push({
+-						url: String(input),
+-						userAgent: new Headers(init?.headers).get("User-Agent"),
+-						signal: init?.signal,
+-					});
+-					return Response.json(answer());
+-				},
+-			},
+-		);
++	it("rejects canary rather than offering an unrelated stable release", async () => {
++		await expect(fetchBuild({ channel: "canary" }, { host })).rejects.toThrow("stable releases only");
++	});
+ 
+-		expect(requests).toHaveLength(1);
+-		expect(requests[0].url).toBe(
+-			"https://build.test/api/products/omp/latest/macos-arm64?channel=canary&from_version=18.8.8",
+-		);
+-		expect(requests[0].userAgent).toBe(`omp/${VERSION}`);
+-		expect(requests[0].signal).toBeInstanceOf(AbortSignal);
+-		expect(build.patch?.fromVersion).toBe("18.8.8");
++	it("rejects draft, prerelease, and malformed fork release metadata", async () => {
++		for (const body of [null, { ...release, draft: true }, { ...release, prerelease: true },
++			{ ...release, tag_name: "v18.8.9" }, { ...release, tag_name: "v18.8.9-fork.0" },
++			{ ...release, assets: null }]) {
++			await expect(fetchBuild({ channel: "stable" }, { host, fetchImpl: async () => Response.json(body) }))
++				.rejects.toThrow("Invalid stable fork release metadata");
++		}
+ 	});
+ 
+-	it("asks for one exact version without a channel", async () => {
+-		delete process.env.PI_BUILD_URL;
+-		let url = "";
++	it("rejects missing, duplicate, or invalid platform assets before downloading", async () => {
++		for (const assets of [
++			[{ name: "omp-darwin-x64", size: 42 }, { name: "SHA256SUMS.txt" }],
++			[{ name: fileName, size: 42 }],
++			[{ name: fileName, size: 42 }, { name: fileName, size: 42 }, { name: "SHA256SUMS.txt" }],
++			[{ name: fileName, size: 0 }, { name: "SHA256SUMS.txt" }],
++		]) {
++			await expect(fetchBuild({ channel: "stable" }, { host, fetchImpl: async () => Response.json({ ...release, assets }) }))
++				.rejects.toThrow(`Fork release does not contain exactly one ${fileName}`);
++		}
++	});
+ 
+-		await fetchBuild(
+-			{ version: "18.8.9" },
+-			{
++	it("rejects missing or ambiguous checksums instead of installing unverifiable bytes", async () => {
++		for (const sums of [`${sha("new")}  omp-darwin-x64\n`, `${checksum}${checksum}`, `not-a-hash  ${fileName}\n`]) {
++			await expect(fetchBuild({ channel: "stable" }, {
+ 				host,
+-				fetchImpl: async input => {
+-					url = String(input);
+-					return Response.json(answer());
+-				},
+-			},
+-		);
+-
+-		expect(url).toBe("https://build.stencil.so/api/products/omp/versions/18.8.9/macos-arm64");
++				fetchImpl: async input => String(input).startsWith(api) ? Response.json(release) : new Response(sums),
++			})).rejects.toThrow(`Missing or ambiguous SHA-256 for ${fileName}`);
++		}
+ 	});
+ 
+-	it("names the target when nothing is published for it", async () => {
+-		await expect(
+-			fetchBuild(
+-				{ channel: "stable" },
+-				{ host, fetchImpl: async () => Response.json({ error: "no_build" }, { status: 404 }) },
+-			),
+-		).rejects.toThrow("No omp stable build for macos-arm64 is published");
++	it("surfaces GitHub release request failures", async () => {
++		await expect(fetchBuild({ channel: "stable" }, {
++			host, fetchImpl: async () => new Response(null, { status: 404 }),
++		})).rejects.toThrow("GitHub release request failed: 404");
+ 	});
+ });
+diff --git a/packages/coding-agent/test/cli/update-cli.test.ts b/packages/coding-agent/test/cli/update-cli.test.ts
+index 126e1ff009..9673c1daeb 100644
+--- a/packages/coding-agent/test/cli/update-cli.test.ts
++++ b/packages/coding-agent/test/cli/update-cli.test.ts
+@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
+ import * as fs from "node:fs/promises";
+ import * as os from "node:os";
+ import * as path from "node:path";
+-import { removeWithRetries, VERSION } from "@oh-my-pi/pi-utils";
++import { removeWithRetries } from "@oh-my-pi/pi-utils";
+ import { currentBuildHost } from "../../src/cli/build-service";
+ import { fixedNpmRegistry } from "../../src/cli/npm-registry";
+-import { getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
++import { compareForkVersions, getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
+ import { cfgUpdateChannel } from "../../src/modes/settings";
+ 
+ const npmjs = fixedNpmRegistry();
+@@ -13,16 +13,30 @@ const npmjs = fixedNpmRegistry();
+ type FetchInput = string | URL | Request;
+ type FetchInit = RequestInit | BunFetchRequestInit;
+ 
++describe("compareForkVersions", () => {
++	it("orders fork revisions after the matching upstream release and numerically", () => {
++		expect(compareForkVersions("18.13.2-fork.1", "18.13.2")).toBeGreaterThan(0);
++		expect(compareForkVersions("18.13.2", "18.13.2-fork.1")).toBeLessThan(0);
++		expect(compareForkVersions("18.13.2-fork.10", "18.13.2-fork.2")).toBeGreaterThan(0);
++		expect(compareForkVersions("18.13.2-fork.2", "18.13.2-fork.2")).toBe(0);
++	});
++
++	it("compares upstream versions before fork revisions without losing numeric precision", () => {
++		expect(compareForkVersions("18.13.3-fork.1", "18.13.2-fork.999")).toBeGreaterThan(0);
++		expect(compareForkVersions("18.13.2-fork.9007199254740993", "18.13.2-fork.9007199254740992")).toBeGreaterThan(0);
++		expect(compareForkVersions("18.13.2-canary.1", "18.13.2")).toBeLessThan(0);
++	});
++});
++
+ describe("runUpdateCommand version source", () => {
+ 	const previousPath = process.env.PATH;
+-	const previousBuildUrl = process.env.PI_BUILD_URL;
++	const previousExitCode = process.exitCode;
+ 	const dirs: string[] = [];
+ 
+ 	afterEach(async () => {
+ 		vi.restoreAllMocks();
+ 		process.env.PATH = previousPath;
+-		if (previousBuildUrl === undefined) delete process.env.PI_BUILD_URL;
+-		else process.env.PI_BUILD_URL = previousBuildUrl;
++		process.exitCode = previousExitCode;
+ 		await Promise.all(dirs.splice(0).map(dir => removeWithRetries(dir)));
+ 	});
+ 
+@@ -66,50 +80,99 @@ describe("runUpdateCommand version source", () => {
+ 		return { logs };
+ 	}
+ 
+-	it("checks npm, with a timeout, when no standalone binary is on PATH", async () => {
++	const api = "https://api.github.com/repos/kierandrewett/oh-my-pi/releases/latest";
++	const version = "999.0.0-fork.1";
++	const releaseBase = `https://github.com/kierandrewett/oh-my-pi/releases/download/v${version}`;
++
++	it("checks the fork release without changing a non-standalone installation or querying npm", async () => {
+ 		await isolatePath();
+-		process.env.PI_BUILD_URL = "https://build.test";
+-		quiet();
+-		const requests = stubFetch(() => Response.json({ version: "999.0.0" }));
++		const { fileName } = await currentBuildHost();
++		const { logs } = quiet();
++		const requests = stubFetch(url => {
++			if (url === api) return Response.json({ tag_name: `v${version}`, draft: false, prerelease: false,
++				assets: [{ name: fileName, size: 42 }, { name: "SHA256SUMS.txt" }] });
++			if (url === `${releaseBase}/SHA256SUMS.txt`) return new Response(`${Bun.SHA256.hash("new", "hex")}  ${fileName}\n`);
++			return new Response(null, { status: 404 });
++		});
+ 
+ 		await runUpdateCommand({ force: false, check: true });
+ 
+-		expect(requests.length).toBeGreaterThan(0);
+-		expect(requests.some(request => request.url.startsWith("https://build.test/"))).toBe(false);
++		expect(requests.map(request => request.url)).toEqual([api, `${releaseBase}/SHA256SUMS.txt`]);
+ 		for (const request of requests) expect(request.signal).toBeInstanceOf(AbortSignal);
++		expect(logs.some(line => line.includes("not a standalone binary") && line.includes("not changed"))).toBe(true);
++	});
++
++	it("refuses to install over a non-standalone installation", async () => {
++		await isolatePath();
++		const { fileName } = await currentBuildHost();
++		const { logs } = quiet();
++		const requests = stubFetch(url => {
++			if (url === api) return Response.json({ tag_name: `v${version}`, draft: false, prerelease: false,
++				assets: [{ name: fileName, size: 42 }, { name: "SHA256SUMS.txt" }] });
++			if (url === `${releaseBase}/SHA256SUMS.txt`) return new Response(`${Bun.SHA256.hash("new", "hex")}  ${fileName}\n`);
++			return new Response(null, { status: 404 });
++		});
++
++		await runUpdateCommand({ force: false, check: false });
++
++		expect(requests.map(request => request.url)).toEqual([api, `${releaseBase}/SHA256SUMS.txt`]);
++		expect(process.exitCode).toBe(1);
++		expect(logs.some(line => line.includes("not a standalone binary") && line.includes("not changed"))).toBe(true);
+ 	});
+ 
+ 	it.skipIf(process.platform === "win32")(
+-		"updates a standalone binary from the build service without asking npm",
++		"updates a standalone binary from verified fork release assets without asking npm",
+ 		async () => {
+ 			const dir = await isolatePath();
+ 			const ompPath = path.join(dir, "omp");
+ 			await Bun.write(ompPath, "#!/bin/sh\necho omp/1.0.0\n");
+ 			await fs.chmod(ompPath, 0o755);
+-			const next = "#!/bin/sh\necho omp/999.0.0\n";
+-			const { target, fileName } = await currentBuildHost();
+-			process.env.PI_BUILD_URL = "https://build.test";
+-			const check = `https://build.test/api/products/omp/latest/${target}?channel=stable&from_version=${VERSION}`;
++			const next = `#!/bin/sh\necho omp/${version}\n`;
++			const { fileName } = await currentBuildHost();
++			const binaryUrl = `${releaseBase}/${fileName}`;
+ 			const { logs } = quiet();
+ 			const requests = stubFetch(url => {
+-				if (url === check) {
+-					return Response.json({
+-						build: { version: "999.0.0" },
+-						file: { name: fileName, size: Buffer.byteLength(next), sha256: Bun.SHA256.hash(next, "hex") },
+-						download: "https://r2.test/omp",
+-					});
+-				}
+-				if (url === "https://r2.test/omp") return new Response(next);
++				if (url === api) return Response.json({ tag_name: `v${version}`, draft: false, prerelease: false,
++					assets: [{ name: fileName, size: Buffer.byteLength(next) }, { name: "SHA256SUMS.txt" }] });
++				if (url === `${releaseBase}/SHA256SUMS.txt`) return new Response(`${Bun.SHA256.hash(next, "hex")}  ${fileName}\n`);
++				if (url === binaryUrl) return new Response(next);
+ 				return new Response(null, { status: 404 });
+ 			});
+ 
+ 			await runUpdateCommand({ force: false, check: false });
+ 
+-			expect(requests.map(request => request.url)).toEqual([check, "https://r2.test/omp"]);
++			expect(requests.map(request => request.url)).toEqual([api, `${releaseBase}/SHA256SUMS.txt`, binaryUrl]);
+ 			expect(await Bun.file(ompPath).text()).toBe(next);
+-			expect(logs.some(line => line.includes("Updated to 999.0.0"))).toBe(true);
++			expect(logs.some(line => line.includes(`Updated to ${version}`))).toBe(true);
++		},
++	);
++
++	it.skipIf(process.platform === "win32")(
++		"leaves the installed binary intact when the release download fails its checksum",
++		async () => {
++			const dir = await isolatePath();
++			const ompPath = path.join(dir, "omp");
++			const original = "#!/bin/sh\necho omp/1.0.0\n";
++			await Bun.write(ompPath, original);
++			await fs.chmod(ompPath, 0o755);
++			const next = `#!/bin/sh\necho omp/${version}\n`;
++			const { fileName } = await currentBuildHost();
++			const { logs } = quiet();
++			stubFetch(url => {
++				if (url === api) return Response.json({ tag_name: `v${version}`, draft: false, prerelease: false,
++					assets: [{ name: fileName, size: Buffer.byteLength(next) }, { name: "SHA256SUMS.txt" }] });
++				if (url === `${releaseBase}/SHA256SUMS.txt`) return new Response(`${Bun.SHA256.hash("different", "hex")}  ${fileName}\n`);
++				if (url === `${releaseBase}/${fileName}`) return new Response(next);
++				return new Response(null, { status: 404 });
++			});
++
++			await expect(runUpdateCommand({ force: false, check: false })).rejects.toThrow("process.exit(1)");
++			expect(logs.some(line => /digest mismatch/i.test(line))).toBe(true);
++			expect(await Bun.file(ompPath).text()).toBe(original);
++			expect(await fs.readdir(dir)).toEqual(["omp"]);
+ 		},
+ 	);
++
+ });
+ 
+ describe("getLatestRelease rename pointers", () => {
+-- 
+2.55.0
+

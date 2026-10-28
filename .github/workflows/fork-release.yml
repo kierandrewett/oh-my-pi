@@ -1,0 +1,115 @@
+name: Fork release
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-22.04
+    outputs:
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      fork_tag: ${{ steps.release.outputs.fork_tag }}
+      build: ${{ steps.release.outputs.build }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Find latest stable upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 scripts/fork/discover.py
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out fork tracker
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          path: tracker
+      - name: Check out upstream release
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: can1357/oh-my-pi
+          ref: ${{ needs.discover.outputs.upstream_tag }}
+          path: upstream
+          persist-credentials: false
+      - name: Apply complete fork patch series
+        run: bash tracker/scripts/fork/apply-patches.sh "$GITHUB_WORKSPACE/tracker" "$GITHUB_WORKSPACE/upstream"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Install Bazelisk
+        run: npm install --global @bazel/bazelisk
+      - name: Install upstream dependencies
+        working-directory: upstream
+        run: bun install --frozen-lockfile
+      - name: Stamp fork version
+        env:
+          UPSTREAM_TAG: ${{ needs.discover.outputs.upstream_tag }}
+          FORK_TAG: ${{ needs.discover.outputs.fork_tag }}
+        run: python3 tracker/scripts/fork/stamp-version.py upstream "$UPSTREAM_TAG" "$FORK_TAG"
+      - name: Build baseline and modern native addons
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          bun scripts/bazel-natives.ts linux-x64-baseline
+          bun scripts/bazel-natives.ts linux-x64-modern
+      - name: Build Linux x64 executable
+        working-directory: upstream
+        env:
+          RELEASE_TARGETS: linux-x64
+        run: bun run ci:release:build-binaries
+      - name: Package binary and checksum
+        working-directory: upstream/packages/coding-agent/binaries
+        env:
+          FORK_TAG: ${{ needs.discover.outputs.fork_tag }}
+        run: |
+          set -euo pipefail
+          test -s omp-linux-x64
+          test "$(./omp-linux-x64 --version)" = "${FORK_TAG#v}"
+          sha256sum omp-linux-x64 > SHA256SUMS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-linux-x64
+          path: |
+            upstream/packages/coding-agent/binaries/omp-linux-x64
+            upstream/packages/coding-agent/binaries/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [discover, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fork-linux-x64
+          path: release
+      - name: Publish complete draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          FORK_TAG: ${{ needs.discover.outputs.fork_tag }}
+          UPSTREAM_TAG: ${{ needs.discover.outputs.upstream_tag }}
+          TRACKER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum --check SHA256SUMS.txt
+          gh release create "$FORK_TAG" omp-linux-x64 SHA256SUMS.txt \
+            --target "$TRACKER_SHA" --draft --title "$FORK_TAG" \
+            --notes "Patched fork of can1357/oh-my-pi $UPSTREAM_TAG. Patch series and build workflow: $TRACKER_SHA."
+          gh release edit "$FORK_TAG" --draft=false --latest
