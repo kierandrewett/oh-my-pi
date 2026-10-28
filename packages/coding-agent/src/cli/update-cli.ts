@@ -34,7 +34,6 @@ import {
 import { type BuildAnswer, type BuildPatch, type Fetch, fetchBuild, type UpdateChannel } from "./build-service";
 import {
 	DEFAULT_NPM_REGISTRY,
-	loadNpmRegistryResolver,
 	type NpmRegistry,
 	type NpmRegistryResolver,
 	npmRegistryPackageUrl,
@@ -190,7 +189,7 @@ export interface VerifiedBinaryDownloadOptions {
 }
 
 /**
- * Download a file and verify its build-service-reported size and SHA-256
+ * Download a file and verify its release-reported size and SHA-256
  * digest (`sha256:<hex>`), leaving it executable. Nothing is left at
  * `targetPath` when the download fails or does not match.
  */
@@ -789,22 +788,21 @@ async function fetchLatestManifest(
 }
 
 /**
- * Get the latest release info from the npm registry, following `omp.rename`
- * pointers ({@link resolveReleaseRename}) when the package has moved to a new
- * npm name. Version, dist, and install names all come from the final manifest
- * in the chain. This is the version source of package-manager installs (bun,
- * npm, Homebrew, mise, Nix); standalone binaries ask the build service
- * ({@link fetchBuild}) instead.
- *
- * The registry comes from the user's npm/bun configuration
- * ({@link loadNpmRegistryResolver}), so a configured feed is honored.
+ * Get the fork release for startup checks. An explicitly supplied registry
+ * resolver supports callers that need to inspect an npm manifest directly.
  */
 export async function getLatestRelease(
 	options: { timeoutMs?: number; channel?: UpdateChannel; registries?: NpmRegistryResolver } = {},
 ): Promise<ReleaseInfo> {
 	const timeoutMs = options.timeoutMs ?? RELEASE_METADATA_TIMEOUT_MS;
 	const channel = options.channel ?? "stable";
-	const registries = options.registries ?? (await loadNpmRegistryResolver());
+	// The fork does not publish an npm package. Startup checks must use the
+	// same fork release as the binary updater, not the upstream registry.
+	if (!options.registries) {
+		const build = await fetchBuild({ channel }, { timeoutMs });
+		return { tag: `v${build.version}`, version: build.version, dist: "binary", packages: CURRENT_PACKAGES, registry: "" };
+	}
+	const registries = options.registries;
 	const packages: ReleasePackages = { ...CURRENT_PACKAGES };
 	const visited = new Set([packages.pkg]);
 	let registry = registries(packages.pkg);
@@ -2086,9 +2084,7 @@ export async function updateViaShimTakeover(
  * a user recovering from a binary-only release straight back through bun.
  */
 function installerHint(): string {
-	return process.platform === "win32"
-		? "& ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary"
-		: "curl -fsSL https://omp.sh/install | sh -s -- --binary";
+	return "https://github.com/kierandrewett/oh-my-pi/releases";
 }
 
 /** Persisted channel, or undefined when settings are unavailable (SDK/test embedding without `Settings.init()`). */
@@ -2123,13 +2119,25 @@ interface UpdateRequest {
 	persistChannel: boolean;
 }
 
+/** Compare upstream cores first, then fork revisions; a fork supersedes its upstream base. */
+export function compareForkVersions(offered: string, current: string): number {
+	const parse = (version: string): { core: string; revision: string } | undefined => {
+		const match = /^(\d+\.\d+\.\d+)(?:-fork\.([1-9]\d*))?$/.exec(version);
+		return match ? { core: match[1], revision: match[2] ?? "0" } : undefined;
+	};
+	const a = parse(offered);
+	const b = parse(current);
+	if (!a || !b) return compareVersions(offered, current);
+	return compareVersions(a.core, b.core) || compareVersions(a.revision, b.revision);
+}
+
 /**
  * Print how the offered `version` relates to the running build. Returns false
  * when there is nothing to install: not newer, and neither `--force` nor a
  * channel switch asks for it.
  */
 function announceOffer(version: string, request: UpdateRequest): boolean {
-	const comparison = compareVersions(version, VERSION);
+	const comparison = compareForkVersions(version, VERSION);
 	if (comparison <= 0 && !request.force && !request.isChannelSwitch) {
 		const icon = theme?.status?.success ?? "✔";
 		console.log(chalk.green(`${icon} Already up to date`));
@@ -2150,9 +2158,7 @@ function announceOffer(version: string, request: UpdateRequest): boolean {
 }
 
 /**
- * Update a standalone binary install from the build service: the newest build
- * on the channel, asked with the installed version so the answer can carry a
- * patch from it. npm is never consulted.
+ * Update a standalone binary from the fork release, never the npm registry.
  */
 async function runBinaryUpdate(
 	target: BinaryUpdateTarget | undefined,
@@ -2276,12 +2282,8 @@ async function runManagedUpdate(
 }
 
 /**
- * Run the update command.
- *
- * The installer that owns the PATH `omp` decides where the version comes
- * from: a standalone binary asks the build service, a package-manager install
- * asks npm. When no target resolves, the running build's kind decides, so
- * `--check` still answers; installing then fails on the unresolved target.
+ * Check the stable fork release. Only standalone binaries are updated in
+ * place; package-managed installs must be migrated explicitly.
  */
 export async function runUpdateCommand(opts: {
 	force: boolean;
@@ -2317,12 +2319,21 @@ export async function runUpdateCommand(opts: {
 	} catch (err) {
 		targetError = err;
 	}
-	if (target?.method === "binary") {
-		await runBinaryUpdate(target, targetError, request);
-	} else if (!target && isCompiledBinary()) {
-		await runBinaryUpdate(undefined, targetError, request);
-	} else {
-		await runManagedUpdate(target, targetError, request);
+	if (target?.method === "binary" || (!target && isCompiledBinary())) {
+		await runBinaryUpdate(target?.method === "binary" ? target : undefined, targetError, request);
+		return;
+	}
+	// Package managers own their launchers and upstream packages. Never ask
+	// them to upgrade this fork or silently replace a managed installation.
+	try {
+		const build = await fetchBuild({ channel: request.channel });
+		announceOffer(build.version, request);
+		console.log(chalk.yellow("This installation is package-managed or not a standalone binary; it was not changed."));
+		console.log(chalk.dim("To migrate explicitly, install a verified fork release binary separately: https://github.com/kierandrewett/oh-my-pi/releases"));
+		if (!request.check) process.exitCode = 1;
+	} catch (err) {
+		console.error(chalk.red(`Failed to check fork releases: ${err}`));
+		process.exitCode = 1;
 	}
 }
 
@@ -2339,7 +2350,7 @@ ${chalk.bold("Options:")}
   -c, --check     Check for updates without installing
   -f, --force     Force reinstall even if up to date
   -l, --plugins   Update installed plugins
-  --canary        Switch to the canary channel and update
+  --canary        Unsupported (fork releases are stable only)
   --stable        Switch back to the stable channel
 
 ${chalk.bold("Examples:")}
@@ -2347,6 +2358,6 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} update --check      Check if updates are available
   ${APP_NAME} update --force      Force reinstall
   ${APP_NAME} update -l           Update installed plugins
-  ${APP_NAME} update --canary    Switch to the canary channel and update
+  ${APP_NAME} update --stable    Use stable fork releases
 `);
 }

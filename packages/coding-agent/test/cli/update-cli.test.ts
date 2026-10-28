@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { removeWithRetries, VERSION } from "@oh-my-pi/pi-utils";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { currentBuildHost } from "../../src/cli/build-service";
 import { fixedNpmRegistry } from "../../src/cli/npm-registry";
-import { getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
+import { compareForkVersions, getLatestRelease, runUpdateCommand } from "../../src/cli/update-cli";
 import { cfgUpdateChannel } from "../../src/modes/settings";
 
 const npmjs = fixedNpmRegistry();
@@ -13,16 +13,30 @@ const npmjs = fixedNpmRegistry();
 type FetchInput = string | URL | Request;
 type FetchInit = RequestInit | BunFetchRequestInit;
 
+describe("compareForkVersions", () => {
+	it("orders fork revisions after the matching upstream release and numerically", () => {
+		expect(compareForkVersions("18.13.2-fork.1", "18.13.2")).toBeGreaterThan(0);
+		expect(compareForkVersions("18.13.2", "18.13.2-fork.1")).toBeLessThan(0);
+		expect(compareForkVersions("18.13.2-fork.10", "18.13.2-fork.2")).toBeGreaterThan(0);
+		expect(compareForkVersions("18.13.2-fork.2", "18.13.2-fork.2")).toBe(0);
+	});
+
+	it("compares upstream versions before fork revisions without losing numeric precision", () => {
+		expect(compareForkVersions("18.13.3-fork.1", "18.13.2-fork.999")).toBeGreaterThan(0);
+		expect(compareForkVersions("18.13.2-fork.9007199254740993", "18.13.2-fork.9007199254740992")).toBeGreaterThan(0);
+		expect(compareForkVersions("18.13.2-canary.1", "18.13.2")).toBeLessThan(0);
+	});
+});
+
 describe("runUpdateCommand version source", () => {
 	const previousPath = process.env.PATH;
-	const previousBuildUrl = process.env.PI_BUILD_URL;
+	const previousExitCode = process.exitCode;
 	const dirs: string[] = [];
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		process.env.PATH = previousPath;
-		if (previousBuildUrl === undefined) delete process.env.PI_BUILD_URL;
-		else process.env.PI_BUILD_URL = previousBuildUrl;
+		process.exitCode = previousExitCode;
 		await Promise.all(dirs.splice(0).map(dir => removeWithRetries(dir)));
 	});
 
@@ -66,50 +80,99 @@ describe("runUpdateCommand version source", () => {
 		return { logs };
 	}
 
-	it("checks npm, with a timeout, when no standalone binary is on PATH", async () => {
+	const api = "https://api.github.com/repos/kierandrewett/oh-my-pi/releases/latest";
+	const version = "999.0.0-fork.1";
+	const releaseBase = `https://github.com/kierandrewett/oh-my-pi/releases/download/v${version}`;
+
+	it("checks the fork release without changing a non-standalone installation or querying npm", async () => {
 		await isolatePath();
-		process.env.PI_BUILD_URL = "https://build.test";
-		quiet();
-		const requests = stubFetch(() => Response.json({ version: "999.0.0" }));
+		const { fileName } = await currentBuildHost();
+		const { logs } = quiet();
+		const requests = stubFetch(url => {
+			if (url === api) return Response.json({ tag_name: `v${version}`, draft: false, prerelease: false,
+				assets: [{ name: fileName, size: 42 }, { name: "SHA256SUMS.txt" }] });
+			if (url === `${releaseBase}/SHA256SUMS.txt`) return new Response(`${Bun.SHA256.hash("new", "hex")}  ${fileName}\n`);
+			return new Response(null, { status: 404 });
+		});
 
 		await runUpdateCommand({ force: false, check: true });
 
-		expect(requests.length).toBeGreaterThan(0);
-		expect(requests.some(request => request.url.startsWith("https://build.test/"))).toBe(false);
+		expect(requests.map(request => request.url)).toEqual([api, `${releaseBase}/SHA256SUMS.txt`]);
 		for (const request of requests) expect(request.signal).toBeInstanceOf(AbortSignal);
+		expect(logs.some(line => line.includes("not a standalone binary") && line.includes("not changed"))).toBe(true);
+	});
+
+	it("refuses to install over a non-standalone installation", async () => {
+		await isolatePath();
+		const { fileName } = await currentBuildHost();
+		const { logs } = quiet();
+		const requests = stubFetch(url => {
+			if (url === api) return Response.json({ tag_name: `v${version}`, draft: false, prerelease: false,
+				assets: [{ name: fileName, size: 42 }, { name: "SHA256SUMS.txt" }] });
+			if (url === `${releaseBase}/SHA256SUMS.txt`) return new Response(`${Bun.SHA256.hash("new", "hex")}  ${fileName}\n`);
+			return new Response(null, { status: 404 });
+		});
+
+		await runUpdateCommand({ force: false, check: false });
+
+		expect(requests.map(request => request.url)).toEqual([api, `${releaseBase}/SHA256SUMS.txt`]);
+		expect(process.exitCode).toBe(1);
+		expect(logs.some(line => line.includes("not a standalone binary") && line.includes("not changed"))).toBe(true);
 	});
 
 	it.skipIf(process.platform === "win32")(
-		"updates a standalone binary from the build service without asking npm",
+		"updates a standalone binary from verified fork release assets without asking npm",
 		async () => {
 			const dir = await isolatePath();
 			const ompPath = path.join(dir, "omp");
 			await Bun.write(ompPath, "#!/bin/sh\necho omp/1.0.0\n");
 			await fs.chmod(ompPath, 0o755);
-			const next = "#!/bin/sh\necho omp/999.0.0\n";
-			const { target, fileName } = await currentBuildHost();
-			process.env.PI_BUILD_URL = "https://build.test";
-			const check = `https://build.test/api/products/omp/latest/${target}?channel=stable&from_version=${VERSION}`;
+			const next = `#!/bin/sh\necho omp/${version}\n`;
+			const { fileName } = await currentBuildHost();
+			const binaryUrl = `${releaseBase}/${fileName}`;
 			const { logs } = quiet();
 			const requests = stubFetch(url => {
-				if (url === check) {
-					return Response.json({
-						build: { version: "999.0.0" },
-						file: { name: fileName, size: Buffer.byteLength(next), sha256: Bun.SHA256.hash(next, "hex") },
-						download: "https://r2.test/omp",
-					});
-				}
-				if (url === "https://r2.test/omp") return new Response(next);
+				if (url === api) return Response.json({ tag_name: `v${version}`, draft: false, prerelease: false,
+					assets: [{ name: fileName, size: Buffer.byteLength(next) }, { name: "SHA256SUMS.txt" }] });
+				if (url === `${releaseBase}/SHA256SUMS.txt`) return new Response(`${Bun.SHA256.hash(next, "hex")}  ${fileName}\n`);
+				if (url === binaryUrl) return new Response(next);
 				return new Response(null, { status: 404 });
 			});
 
 			await runUpdateCommand({ force: false, check: false });
 
-			expect(requests.map(request => request.url)).toEqual([check, "https://r2.test/omp"]);
+			expect(requests.map(request => request.url)).toEqual([api, `${releaseBase}/SHA256SUMS.txt`, binaryUrl]);
 			expect(await Bun.file(ompPath).text()).toBe(next);
-			expect(logs.some(line => line.includes("Updated to 999.0.0"))).toBe(true);
+			expect(logs.some(line => line.includes(`Updated to ${version}`))).toBe(true);
 		},
 	);
+
+	it.skipIf(process.platform === "win32")(
+		"leaves the installed binary intact when the release download fails its checksum",
+		async () => {
+			const dir = await isolatePath();
+			const ompPath = path.join(dir, "omp");
+			const original = "#!/bin/sh\necho omp/1.0.0\n";
+			await Bun.write(ompPath, original);
+			await fs.chmod(ompPath, 0o755);
+			const next = `#!/bin/sh\necho omp/${version}\n`;
+			const { fileName } = await currentBuildHost();
+			const { logs } = quiet();
+			stubFetch(url => {
+				if (url === api) return Response.json({ tag_name: `v${version}`, draft: false, prerelease: false,
+					assets: [{ name: fileName, size: Buffer.byteLength(next) }, { name: "SHA256SUMS.txt" }] });
+				if (url === `${releaseBase}/SHA256SUMS.txt`) return new Response(`${Bun.SHA256.hash("different", "hex")}  ${fileName}\n`);
+				if (url === `${releaseBase}/${fileName}`) return new Response(next);
+				return new Response(null, { status: 404 });
+			});
+
+			await expect(runUpdateCommand({ force: false, check: false })).rejects.toThrow("process.exit(1)");
+			expect(logs.some(line => /digest mismatch/i.test(line))).toBe(true);
+			expect(await Bun.file(ompPath).text()).toBe(original);
+			expect(await fs.readdir(dir)).toEqual(["omp"]);
+		},
+	);
+
 });
 
 describe("getLatestRelease rename pointers", () => {

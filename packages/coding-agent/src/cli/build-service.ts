@@ -1,31 +1,4 @@
-/**
- * Client for Stencil's build service, the source of omp's standalone binaries.
- *
- * `omp update` on a standalone binary install, the binary takeover of a
- * package-manager install, and the startup update check of a compiled binary
- * all ask the service which build to install ({@link fetchBuild}):
- *
- * - `GET {origin}/api/products/omp/latest/{target}?channel=stable|canary` for
- *   the newest build on a channel;
- * - `GET {origin}/api/products/omp/versions/{version}/{target}` for one exact
- *   version.
- *
- * omp is a public product, so no token is sent. The origin is `PI_BUILD_URL`
- * ({@link DEFAULT_BUILD_URL} when unset). `{target}` is
- * `{macos|linux|linux-musl|windows}-{arm64|x86_64}` ({@link resolveBuildHost}).
- * Requests carry `User-Agent: omp/<version>`, which the service counts in its
- * update-check statistics.
- *
- * Adding `from_version=<installed version>` makes the answer carry an
- * HDiffPatch patch from that version's file to the answered one when the
- * service has it; when it does not yet, the service starts making it
- * (`patch_pending`) so a later check finds it.
- *
- * An answer is checked before anything in it is used ({@link parseBuildAnswer}):
- * a malformed answer is an error, a malformed `patch` is dropped so the whole
- * file still installs. `404 {"error":"no_build"}` means nothing is published
- * for the target (on the channel, or at the version).
- */
+/** Fork release discovery and shared build metadata types for the updater. */
 import * as fs from "node:fs";
 import { $env, APP_NAME, isRecord, VERSION } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
@@ -44,7 +17,7 @@ export type Fetch = (input: string | URL | Request, init?: RequestInit) => Promi
 export const DEFAULT_BUILD_URL = "https://build.stencil.so";
 
 /** The product omp's builds are published under. */
-const PRODUCT = "omp";
+const FORK_REPOSITORY = "kierandrewett/oh-my-pi";
 
 const BUILD_CHECK_TIMEOUT_MS = 30_000;
 
@@ -246,58 +219,51 @@ export interface FetchBuildOptions {
 	host?: BuildHost;
 }
 
-/** Ask the build service for a build of this host's target ({@link BuildSelector}). */
+/** Fetch a stable fork release and verify its platform-specific checksum metadata. */
 export async function fetchBuild(selector: BuildSelector, options: FetchBuildOptions = {}): Promise<BuildAnswer> {
+	if ("channel" in selector && selector.channel !== "stable") {
+		throw new Error("The fork publishes stable releases only; use --stable.");
+	}
 	const host = options.host ?? (await currentBuildHost());
-	const origin = buildServiceUrl();
 	const timeoutMs = options.timeoutMs ?? BUILD_CHECK_TIMEOUT_MS;
-	const route =
-		"channel" in selector
-			? `latest/${host.target}`
-			: `versions/${encodeURIComponent(selector.version)}/${host.target}`;
-	const url = new URL(`${origin}/api/products/${PRODUCT}/${route}`);
-	if ("channel" in selector) url.searchParams.set("channel", selector.channel);
-	if (options.fromVersion) url.searchParams.set("from_version", options.fromVersion);
-	const what = `${APP_NAME} ${"channel" in selector ? `${selector.channel} build` : `build ${selector.version}`} for ${host.target}`;
-
-	const mapError = (err: unknown): unknown => {
-		if (isTimeoutError(err)) {
-			return new Error(`Timed out asking ${origin} for the ${what} after ${Math.round(timeoutMs / 1000)}s`, {
-				cause: err,
-			});
-		}
-		if (isUnsupportedProxyError(err)) return new Error(unsupportedProxyMessage(), { cause: err });
-		return err;
-	};
-
-	let response: Response;
-	let body: unknown;
-	try {
-		response = await (options.fetchImpl ?? fetch)(url, {
-			headers: { Accept: "application/json", "User-Agent": `${APP_NAME}/${VERSION}` },
-			signal: withTimeoutSignal(timeoutMs),
-		});
+	const fetchImpl = options.fetchImpl ?? fetch;
+	const api = `https://api.github.com/repos/${FORK_REPOSITORY}/releases`;
+	const route = "version" in selector ? `/tags/${encodeURIComponent(`v${selector.version}`)}` : "/latest";
+	const request = async (url: string, accept: string): Promise<Response> => {
 		try {
-			body = await response.json();
+			const response = await fetchImpl(url, {
+				headers: { Accept: accept, "User-Agent": `${APP_NAME}/${VERSION}` },
+				signal: withTimeoutSignal(timeoutMs),
+			});
+			if (!response.ok) throw new Error(`GitHub release request failed: ${response.status} ${response.statusText}`);
+			return response;
 		} catch (err) {
-			// A malformed body is reported below; body-read timeouts and resets surface.
-			if (!(err instanceof SyntaxError)) throw err;
+			if (isTimeoutError(err)) throw new Error("Timed out fetching fork release metadata", { cause: err });
+			if (isUnsupportedProxyError(err)) throw new Error(unsupportedProxyMessage(), { cause: err });
+			throw err;
 		}
-	} catch (err) {
-		throw mapError(err);
+	};
+	const release: unknown = await (await request(`${api}${route}`, "application/vnd.github+json")).json();
+	if (!isRecord(release) || release.draft !== false || release.prerelease !== false ||
+		typeof release.tag_name !== "string" || !/^v\d+\.\d+\.\d+-fork\.[1-9]\d*$/.test(release.tag_name) ||
+		!Array.isArray(release.assets)) {
+		throw new Error("Invalid stable fork release metadata");
 	}
-
-	if (response.status === 404 && isRecord(body) && body.error === "no_build") {
-		const hint =
-			"channel" in selector && selector.channel === "canary" ? ` Try \`${APP_NAME} update --stable\`.` : "";
-		throw new Error(`No ${what} is published on ${origin} yet.${hint}`);
+	const version = release.tag_name.slice(1);
+	if ("version" in selector && selector.version !== version) throw new Error("Fork release version mismatch");
+	const asset = release.assets.filter((entry: unknown) => isRecord(entry) && entry.name === host.fileName);
+	const sums = release.assets.filter((entry: unknown) => isRecord(entry) && entry.name === "SHA256SUMS.txt");
+	if (asset.length !== 1 || sums.length !== 1 || !isRecord(asset[0]) || !isSize(asset[0].size)) {
+		throw new Error(`Fork release does not contain exactly one ${host.fileName} and SHA256SUMS.txt`);
 	}
-	if (!response.ok) {
-		throw new Error(`${origin} answered ${response.status} ${response.statusText} for the ${what}`);
-	}
-	try {
-		return parseBuildAnswer(body, host.fileName, options.fromVersion);
-	} catch (err) {
-		throw new Error(`Invalid answer from ${origin} for the ${what}: ${err instanceof Error ? err.message : err}`);
-	}
+	const base = `https://github.com/${FORK_REPOSITORY}/releases/download/${encodeURIComponent(release.tag_name)}`;
+	const checksumText = await (await request(`${base}/SHA256SUMS.txt`, "text/plain")).text();
+	const matches = checksumText.split(/\r?\n/).map(line => /^([0-9a-fA-F]{64}) [ *](.+)$/.exec(line))
+		.filter(match => match?.[2] === host.fileName);
+	if (matches.length !== 1 || !matches[0]) throw new Error(`Missing or ambiguous SHA-256 for ${host.fileName}`);
+	return {
+		version,
+		file: { name: host.fileName, size: asset[0].size, sha256: matches[0][1].toLowerCase() },
+		download: `${base}/${encodeURIComponent(host.fileName)}`,
+	};
 }

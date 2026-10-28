@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import {
 	type BuildHost,
 	fetchBuild,
@@ -115,68 +115,94 @@ describe("build service targets", () => {
 	});
 });
 
-describe("fetchBuild", () => {
+describe("fetchBuild fork releases", () => {
 	const host: BuildHost = { target: "macos-arm64", fileName };
-	const previousUrl = process.env.PI_BUILD_URL;
+	const api = "https://api.github.com/repos/kierandrewett/oh-my-pi/releases";
+	const tag = "v18.8.9-fork.2";
+	const download = `https://github.com/kierandrewett/oh-my-pi/releases/download/${tag}`;
+	const release = {
+		tag_name: tag,
+		draft: false,
+		prerelease: false,
+		assets: [{ name: fileName, size: 42 }, { name: "SHA256SUMS.txt" }],
+	};
+	const checksum = `${sha("new").toUpperCase()}  ${fileName}\n`;
 
-	afterEach(() => {
-		if (previousUrl === undefined) delete process.env.PI_BUILD_URL;
-		else process.env.PI_BUILD_URL = previousUrl;
-	});
-
-	it("asks the configured origin for the channel's newest build, naming the installed version", async () => {
-		process.env.PI_BUILD_URL = "https://build.test/";
-		const requests: Array<{ url: string; userAgent: string | null; signal: AbortSignal | null | undefined }> = [];
-
-		const build = await fetchBuild(
-			{ channel: "canary" },
-			{
-				host,
-				fromVersion: "18.8.8",
-				fetchImpl: async (input, init) => {
-					requests.push({
-						url: String(input),
-						userAgent: new Headers(init?.headers).get("User-Agent"),
-						signal: init?.signal,
-					});
-					return Response.json(answer());
-				},
+	it("uses the stable GitHub release and checksum to offer the host binary", async () => {
+		const requests: Array<{ url: string; accept: string | null; userAgent: string | null; signal: AbortSignal | null | undefined }> = [];
+		const build = await fetchBuild({ channel: "stable" }, {
+			host,
+			fromVersion: "18.8.8",
+			fetchImpl: async (input, init) => {
+				const url = String(input);
+				requests.push({ url, accept: new Headers(init?.headers).get("Accept"), userAgent: new Headers(init?.headers).get("User-Agent"), signal: init?.signal });
+				return url === `${api}/latest` ? Response.json(release) : new Response(checksum);
 			},
-		);
-
-		expect(requests).toHaveLength(1);
-		expect(requests[0].url).toBe(
-			"https://build.test/api/products/omp/latest/macos-arm64?channel=canary&from_version=18.8.8",
-		);
-		expect(requests[0].userAgent).toBe(`omp/${VERSION}`);
-		expect(requests[0].signal).toBeInstanceOf(AbortSignal);
-		expect(build.patch?.fromVersion).toBe("18.8.8");
+		});
+		expect(requests.map(request => [request.url, request.accept])).toEqual([
+			[`${api}/latest`, "application/vnd.github+json"],
+			[`${download}/SHA256SUMS.txt`, "text/plain"],
+		]);
+		for (const request of requests) {
+			expect(request.userAgent).toBe(`omp/${VERSION}`);
+			expect(request.signal).toBeInstanceOf(AbortSignal);
+		}
+		expect(build).toEqual({
+			version: "18.8.9-fork.2",
+			file: { name: fileName, size: 42, sha256: sha("new") },
+			download: `${download}/${fileName}`,
+		});
 	});
 
-	it("asks for one exact version without a channel", async () => {
-		delete process.env.PI_BUILD_URL;
-		let url = "";
+	it("requests an exact fork version and rejects a different returned tag", async () => {
+		const urls: string[] = [];
+		const fetchImpl = async (input: string | URL | Request) => {
+			const url = String(input);
+			urls.push(url);
+			return url.startsWith(api) ? Response.json(release) : new Response(checksum);
+		};
+		await fetchBuild({ version: "18.8.9-fork.2" }, { host, fetchImpl });
+		expect(urls[0]).toBe(`${api}/tags/${tag}`);
+		await expect(fetchBuild({ version: "18.8.9-fork.1" }, { host, fetchImpl })).rejects.toThrow("version mismatch");
+	});
 
-		await fetchBuild(
-			{ version: "18.8.9" },
-			{
+	it("rejects canary rather than offering an unrelated stable release", async () => {
+		await expect(fetchBuild({ channel: "canary" }, { host })).rejects.toThrow("stable releases only");
+	});
+
+	it("rejects draft, prerelease, and malformed fork release metadata", async () => {
+		for (const body of [null, { ...release, draft: true }, { ...release, prerelease: true },
+			{ ...release, tag_name: "v18.8.9" }, { ...release, tag_name: "v18.8.9-fork.0" },
+			{ ...release, assets: null }]) {
+			await expect(fetchBuild({ channel: "stable" }, { host, fetchImpl: async () => Response.json(body) }))
+				.rejects.toThrow("Invalid stable fork release metadata");
+		}
+	});
+
+	it("rejects missing, duplicate, or invalid platform assets before downloading", async () => {
+		for (const assets of [
+			[{ name: "omp-darwin-x64", size: 42 }, { name: "SHA256SUMS.txt" }],
+			[{ name: fileName, size: 42 }],
+			[{ name: fileName, size: 42 }, { name: fileName, size: 42 }, { name: "SHA256SUMS.txt" }],
+			[{ name: fileName, size: 0 }, { name: "SHA256SUMS.txt" }],
+		]) {
+			await expect(fetchBuild({ channel: "stable" }, { host, fetchImpl: async () => Response.json({ ...release, assets }) }))
+				.rejects.toThrow(`Fork release does not contain exactly one ${fileName}`);
+		}
+	});
+
+	it("rejects missing or ambiguous checksums instead of installing unverifiable bytes", async () => {
+		for (const sums of [`${sha("new")}  omp-darwin-x64\n`, `${checksum}${checksum}`, `not-a-hash  ${fileName}\n`]) {
+			await expect(fetchBuild({ channel: "stable" }, {
 				host,
-				fetchImpl: async input => {
-					url = String(input);
-					return Response.json(answer());
-				},
-			},
-		);
-
-		expect(url).toBe("https://build.stencil.so/api/products/omp/versions/18.8.9/macos-arm64");
+				fetchImpl: async input => String(input).startsWith(api) ? Response.json(release) : new Response(sums),
+			})).rejects.toThrow(`Missing or ambiguous SHA-256 for ${fileName}`);
+		}
 	});
 
-	it("names the target when nothing is published for it", async () => {
-		await expect(
-			fetchBuild(
-				{ channel: "stable" },
-				{ host, fetchImpl: async () => Response.json({ error: "no_build" }, { status: 404 }) },
-			),
-		).rejects.toThrow("No omp stable build for macos-arm64 is published");
+	it("surfaces GitHub release request failures", async () => {
+		await expect(fetchBuild({ channel: "stable" }, {
+			host, fetchImpl: async () => new Response(null, { status: 404 }),
+		})).rejects.toThrow("GitHub release request failed: 404");
 	});
 });
