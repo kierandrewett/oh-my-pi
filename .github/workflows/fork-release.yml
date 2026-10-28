@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           test -s omp-linux-x64
-          test "$(./omp-linux-x64 --version)" = "${FORK_TAG#v}"
+          test "$(./omp-linux-x64 --version)" = "omp/${FORK_TAG#v}"
           sha256sum omp-linux-x64 > SHA256SUMS.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
